@@ -1,0 +1,130 @@
+# ============================================================
+# OPTIMIZED PEER SET PIPELINE — pandas only, no pyspark.
+# Replaces the 12x copy/concat block AND the old peersetspark.
+#
+# Keep from your original notebook (run before this):
+#   - corpsfmerge (merged, cleaned, percent_pos_usa filled)
+#   - peer_types         (array of 12 industry labels)
+#   - airspendimportance (your weighting number)
+# ============================================================
+
+import pandas as pd
+
+# ------------------------------------------------------------
+# Prep: build the lookup dataframe once. Numeric cols coerced up front.
+# ------------------------------------------------------------
+corpsfmerge2_copy = corpsfmerge.copy()
+corpsfmerge2_copy['spendsum']          = pd.to_numeric(corpsfmerge2_copy['spendsum'], errors='coerce')
+corpsfmerge2_copy['numberofemployees'] = pd.to_numeric(corpsfmerge2_copy['numberofemployees'], errors='coerce')
+
+
+# ------------------------------------------------------------
+# LAYER 1 — runs ONCE per corp.
+# Country filter, per-corp scalars, and every rank that does
+# NOT depend on peer type.
+# ------------------------------------------------------------
+def compute_corp_base(rowthis):
+    corpidthis  = rowthis.corp_id
+    countrythis = rowthis.pos_ctry
+
+    df = corpsfmerge2_copy[corpsfmerge2_copy['pos_ctry'] == int(countrythis)].copy()
+    df.reset_index(drop=True, inplace=True)
+
+    mask = (df['corp_id'] == corpidthis)
+    if not mask.any():
+        return None  # corp not in its own country slice; skip
+
+    spend_capid     = df.loc[mask, 'spendsum'].item()
+    pos_usa         = df.loc[mask, 'percent_pos_usa'].item()
+    online_capid    = df.loc[mask, 'online_bookings_percent'].item()
+    domestic_capid  = df.loc[mask, 'economy_and_domestic_percent'].item()
+    employees_capid = df.loc[mask, 'numberofemployees'].item()
+    industry_capid  = df.loc[mask, 'industry'].item()
+
+    # ranks computed BEFORE industry filter -> identical across all 12 types
+    df['tempabsspenddiff']  = abs(df['spendsum'] - spend_capid).fillna(9999999)
+    df['tempabsspendrank']  = df['tempabsspenddiff'].rank()
+
+    df['tempposdiff']       = abs(df['percent_pos_usa'] - pos_usa).fillna(9999999)
+    df['tempposrank']       = df['tempposdiff'].rank(method='min')
+
+    df['temponlinediff']    = abs(df['online_bookings_percent'] - online_capid).fillna(9999999)
+    df['temponlinerank']    = df['temponlinediff'].rank()
+
+    df['tempdomesticdiff']  = abs(df['economy_and_domestic_percent'] - domestic_capid).fillna(9999999)
+    df['tempdomesticrank']  = df['tempdomesticdiff'].rank()
+
+    df['tempnemployeediff'] = abs(df['numberofemployees'] - employees_capid).fillna(0)
+    df['tempnemployeerank'] = df['tempnemployeediff'].rank()
+
+    return df, corpidthis, industry_capid
+
+
+# ------------------------------------------------------------
+# LAYER 2 — runs per peer type (cheap part only).
+# ------------------------------------------------------------
+def peerset_for_type(df, corpidthis, industry_capid, peer_typethis, rowthis):
+    industrycheck = industry_capid
+    if peer_typethis != 'Others Like Me' and 'Industry' in peer_typethis:
+        industrycheck = peer_typethis
+
+    sub = df[df['industry'] == industrycheck].copy()
+    if sub.empty:
+        return None
+
+    sub['tempindustrydiff'] = 1 * (sub['industry'] == industrycheck)
+    sub['tempindustryrank'] = sub['tempindustrydiff'].rank(ascending=True)
+    sub['totalrank'] = sub['tempindustryrank'] + airspendimportance * sub['tempabsspendrank']
+
+    if peer_typethis == 'Others Like Me':
+        sub['totalrank'] = (sub['totalrank']
+                            + sub['tempposrank']
+                            + sub['tempnemployeerank']
+                            + sub['temponlinerank']
+                            + sub['tempdomesticrank'])
+
+    sorted_ = (sub.loc[sub['corp_id'] != corpidthis,
+                       ['corp_id', 'totalrank', 'total_air_spend']]
+                  .nsmallest(30, 'totalrank')
+                  .reset_index(drop=True))
+
+    peerset1 = sorted_['corp_id'].tolist()
+    if len(peerset1) >= 21:
+        result = {
+            'corp_id':  rowthis.corp_id,
+            'pos_ctry': rowthis.pos_ctry,
+            'peertype': str(peer_typethis),
+        }
+        for i in range(21):
+            result[f'peer{i+1}'] = str(peerset1[i])
+        return result
+    return None
+
+
+# ------------------------------------------------------------
+# DRIVER — loop corps once (heavy), 12 types each (cheap).
+# Set TEST_N small first to verify match, then None for full run.
+# ------------------------------------------------------------
+TEST_N = 3   # <-- start small; set to None for the full run
+
+base = corpsfmerge[['corp_id', 'pos_ctry']].drop_duplicates().reset_index(drop=True)
+base['corp_id']  = base['corp_id'].astype(str)
+base['pos_ctry'] = base['pos_ctry'].astype(str)
+
+if TEST_N is not None:
+    base = base.head(TEST_N)
+
+results = []
+for _, row in base.iterrows():
+    out_base = compute_corp_base(row)
+    if out_base is None:
+        continue
+    df, corpidthis, industry_capid = out_base
+    for ptype in peer_types:
+        out = peerset_for_type(df, corpidthis, industry_capid, ptype, row)
+        if out is not None:
+            results.append(out)
+
+corpsfmerge3 = pd.DataFrame(results)
+print(corpsfmerge3.shape)
+corpsfmerge3.head(20)
