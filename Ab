@@ -1,95 +1,161 @@
-import pandas as pd
 import numpy as np
+import pandas as pd
+from itertools import combinations
+from joblib import Parallel, delayed
 
-PEER_COLS = [f'peer{i}' for i in range(1, 22)]   # peer1..peer21
+# =====================================================================
+# 1. ONE-TIME SETUP  (run ONCE, before the loop — not per row)
+# =====================================================================
+SPEND_COLS = ["total_air_spend", "total_car_spend", "total_hotel_spend"]
+PEER_COLS = [f"peer{i}" for i in range(1, 21)]
 
-# ---- pre-group reference frame by country ONCE (was: filter 20100x per call) ----
-corpsfmerge2_copy['numberofemployees'] = pd.to_numeric(corpsfmerge2_copy['numberofemployees'], errors='coerce')
-ref_by_ctry = {int(c): g.reset_index(drop=True)
-               for c, g in corpsfmerge2_copy.groupby('pos_ctry')}
+
+def build_lookup(corpsfmerge: pd.DataFrame) -> dict:
+    """(corp_id, pos_ctry) is unique -> O(1) lookup instead of df filtering.
+    fillna is done ONCE here, not 127k times."""
+    df = corpsfmerge.copy()
+    df[SPEND_COLS] = df[SPEND_COLS].fillna(0)
+    keys = zip(df["corp_id"].astype(str), df["pos_ctry"].astype(int))
+    vals = zip(
+        df["total_air_spend"].to_numpy(),
+        df["total_car_spend"].to_numpy(),
+        df["total_hotel_spend"].to_numpy(),
+    )
+    return dict(zip(keys, vals))
 
 
-def peersetspark_company(rowthis):
-    """Process ONE company across all 12 peertypes. Returns list of dicts."""
-    corpidthis  = rowthis['corp_id']
-    countrythis = rowthis['pos_ctry']
+# =====================================================================
+# 2. checkcompliance — same semantics as yours, cleaned up
+#    (sort-desc + pop replaces repeated argmax+del; '-'.join replaces
+#     the manual string loop)
+# =====================================================================
+def checkcompliance(travelarray):
+    # keep positive spends with their original 1-based indices
+    pairs = [(v, i + 1) for i, v in enumerate(travelarray) if v > 0]
+    if len(pairs) <= 4:
+        return "NULL"
 
-    corpsfmerge2this = ref_by_ctry.get(int(countrythis))
-    if corpsfmerge2this is None:
-        return []
-    corpsfmerge2this = corpsfmerge2this.copy()   # one copy per company, not per peertype
+    values = [v for v, _ in pairs]
+    total = sum(values)
+    mx = max(values)
 
-    # ----- self-company values (fetched once) -----
-    selfmask = corpsfmerge2this['corp_id'] == corpidthis
-    if not selfmask.any():
-        return []
-    selfrow = corpsfmerge2this.loc[selfmask].iloc[0]
+    if mx / total < 0.25:
+        return "-".join(str(i) for _, i in pairs)
 
-    # ----- the 5 diff/rank columns: SAME for all 12 peertypes, computed once -----
-    spenddifff_value_capid = selfrow['spendsum']
-    corpsfmerge2this['tempabsspenddiff'] = abs(corpsfmerge2this['spendsum'] - spenddifff_value_capid).fillna(9999999)
-    corpsfmerge2this['tempabsspendrank'] = corpsfmerge2this['tempabsspenddiff'].rank()
+    if mx / total > 0.25:  # exactly == 0.25 stays NULL, same as your code
+        pairs.sort(key=lambda p: p[0], reverse=True)  # biggest first
+        while len(pairs) > 5:
+            total -= pairs[0][0]          # drop current max
+            pairs.pop(0)
+            if pairs[0][0] / total < 0.25:
+                idx = sorted(i for _, i in pairs)  # original ascending order
+                return "-".join(str(i) for i in idx)
+    return "NULL"
 
-    percent_pos_usa = selfrow['percent_pos_usa']
-    corpsfmerge2this['tempposdiff'] = abs(corpsfmerge2this['percent_pos_usa'] - percent_pos_usa).fillna(9999999)
-    corpsfmerge2this['tempposrank'] = corpsfmerge2this['tempposdiff'].rank(method='min')
 
-    online_booking_percent = selfrow['online_bookings_percent']
-    corpsfmerge2this['temponlinediff'] = abs(corpsfmerge2this['online_bookings_percent'] - online_booking_percent).fillna(9999999)
-    corpsfmerge2this['temponlinerank'] = corpsfmerge2this['temponlinediff'].rank()
+# =====================================================================
+# 3. has_5_combination — BUG FIX: your spend_dictionary was keyed by
+#    spend VALUE, so duplicate spends overwrote each other's index.
+#    Carrying (value, index) pairs fixes that. Max C(20,5)=15,504
+#    combos, cheap enough.
+# =====================================================================
+def has_5_combination_under_ratio(spend, ratio=0.25):
+    pairs = [(v, i + 1) for i, v in enumerate(spend) if v > 0]
+    if len(pairs) < 5:
+        return "NULL"
+    for subset in combinations(pairs, 5):
+        s_sum = sum(v for v, _ in subset)
+        s_max = max(v for v, _ in subset)
+        if s_max < ratio * s_sum:
+            return [i for _, i in subset]
+    return "NULL"
 
-    economic_and_domestic_percent = selfrow['economy_and_domestic_percent']
-    corpsfmerge2this['tempdomesticdiff'] = abs(corpsfmerge2this['economy_and_domestic_percent'] - economic_and_domestic_percent).fillna(9999999)
-    corpsfmerge2this['tempdomesticrank'] = corpsfmerge2this['tempdomesticdiff'].rank()
 
-    number_of_employees = selfrow['numberofemployees']
-    corpsfmerge2this['tempnemployeediff'] = abs(pd.to_numeric(corpsfmerge2this['numberofemployees']) - number_of_employees).fillna(0)
-    corpsfmerge2this['tempnemployeerank'] = corpsfmerge2this['tempnemployeediff'].rank()
+# =====================================================================
+# 4. Per-row worker — NO dataframe touched here. 20 dict lookups only.
+# =====================================================================
+def compliance_row(row, lookup):
+    pos = int(row.pos_ctry)
+    airarray, cararray, hotelarray = [], [], []
 
-    own_industry = selfrow['industry']
+    for peer in (getattr(row, c) for c in PEER_COLS):
+        a, c, h = lookup.get((str(peer), pos), (0, 0, 0))
+        airarray.append(a)
+        cararray.append(c)
+        hotelarray.append(h)
 
+    air_list = checkcompliance(airarray)
+    car_list = checkcompliance(cararray)
+    htl_list = checkcompliance(hotelarray)
+
+    # fallback: exhaustive 5-combination search
+    if htl_list == "NULL":
+        upd = has_5_combination_under_ratio(hotelarray)
+        if upd != "NULL":
+            htl_list = "-".join(str(v) for v in upd)
+    if air_list == "NULL":
+        upd = has_5_combination_under_ratio(airarray)
+        if upd != "NULL":
+            air_list = "-".join(str(v) for v in upd)
+    if car_list == "NULL":
+        upd = has_5_combination_under_ratio(cararray)
+        if upd != "NULL":
+            car_list = "-".join(str(v) for v in upd)
+
+    # car fallback via hotel ∩ air intersection (same as your logic)
+    if car_list == "NULL" and htl_list != "NULL" and air_list != "NULL":
+        inter = sorted(
+            set(map(int, htl_list.split("-"))) & set(map(int, air_list.split("-")))
+        )
+        if len(inter) > 4:
+            car_list = "-".join(str(v) for v in inter)
+
+    return {
+        "corp_id": row.corp_id,
+        "pos_ctry": row.pos_ctry,
+        "aircompliance": str(air_list),
+        "carcompliance": str(car_list),
+        "hotelcompliance": str(htl_list),
+        "peer_type": row.peertype,
+    }
+
+
+# =====================================================================
+# 5. Driver — chunked joblib. Chunking (not delayed-per-row) keeps
+#    pickling overhead low.
+# =====================================================================
+def run_compliance(peers_df, corpsfmerge, n_jobs=-1, chunk_size=8000):
+    lookup = build_lookup(corpsfmerge)
+    rows = list(peers_df.itertuples(index=False))
+    chunks = [rows[i:i + chunk_size] for i in range(0, len(rows), chunk_size)]
+
+    def process_chunk(chunk):
+        return [compliance_row(r, lookup) for r in chunk]
+
+    out = Parallel(n_jobs=n_jobs, backend="loky")(
+        delayed(process_chunk)(c) for c in chunks
+    )
+    return pd.DataFrame([r for chunk in out for r in chunk])
+
+
+# Usage:
+# result_df = run_compliance(peers_df, corpsfmerge)
+
+
+
+
+# Build lookup ONCE (reuse it for every call, don't rebuild)
+lookup = build_lookup(corpsfmerge)
+
+def run_compliance(peers_df, lookup):
     results = []
-    # ----- now loop the 12 peertypes; only industry-filter + totalrank differ -----
-    for peer_typethis in peer_types:
-
-        if peer_typethis != 'Others Like Me' and 'Industry' in peer_typethis:
-            industrycheck = peer_typethis
-        else:
-            industrycheck = own_industry
-
-        # industry filter (his order: ranks already computed above on full country slice)
-        corpsfmerge2this2 = corpsfmerge2this[corpsfmerge2this['industry'] == industrycheck].copy()
-
-        corpsfmerge2this2['tempindustrydiff'] = 1 * (corpsfmerge2this2['industry'] == industrycheck)
-        corpsfmerge2this2['tempindustryrank'] = corpsfmerge2this2['tempindustrydiff'].rank(ascending=True)
-        corpsfmerge2this2['totalrank'] = corpsfmerge2this2['tempindustryrank'] + airspendimportance * corpsfmerge2this2['tempabsspendrank']
-
-        if peer_typethis == 'Others Like Me':
-            corpsfmerge2this2['totalrank'] = (corpsfmerge2this2['totalrank']
-                                              + corpsfmerge2this2['tempposrank']
-                                              + corpsfmerge2this2['tempnemployeerank']
-                                              + corpsfmerge2this2['temponlinerank']
-                                              + corpsfmerge2this2['tempdomesticrank'])
-
-        corpsfmergesorted = corpsfmerge2this2.loc[
-            corpsfmerge2this2['corp_id'] != corpidthis,
-            ['corp_id', 'totalrank', 'total_air_spend']
-        ].nsmallest(21, 'totalrank').reset_index(drop=True)
-
-        if len(corpsfmergesorted) == 21:
-            ans = {"corp_id": corpidthis, "pos_ctry": countrythis, "peertype": peer_typethis}
-            for i, j in zip(PEER_COLS, corpsfmergesorted['corp_id'].tolist()):
-                ans[i] = j
-            results.append(ans)
-
-    return results
+    for row in peers_df.itertuples(index=False):
+        results.append(compliance_row(row, lookup))
+    return pd.DataFrame(results)
 
 
-# ---- run over 20100 companies (NOT 12x20100); each returns up to 12 dicts ----
-bm_peerset_unique = bm_peerset_spark1   # one row per company (corp_id, pos_ctry, ...)
+lookup = build_lookup(corpsfmerge)          # once
 
-allrows = []
-for _, rowthis in bm_peerset_unique.iterrows():
-    allrows.extend(peersetspark_company(rowthis))
-
-final_df = pd.DataFrame(allrows, columns=['corp_id', 'pos_ctry', 'peertype'] + PEER_COLS)
+out1 = run_compliance(peers_df.head(1), lookup)     # 1 row
+out100 = run_compliance(peers_df.head(100), lookup) # 100 rows
+out_all = run_compliance(peers_df, lookup)          # full 127k
