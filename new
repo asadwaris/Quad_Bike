@@ -1,69 +1,35 @@
 import re
-import numpy as np
 import pandas as pd
-from rapidfuzz import process
-from rapidfuzz.distance import JaroWinkler
-from sklearn.cluster import AgglomerativeClustering
+
+BRANDS = {
+    'NATIONAL':  ['national'],
+    'ENTERPRISE':['enterprise', 'enterpri'],
+    'HERTZ':     ['hertz'],
+    'BUDGET':    ['budget'],
+    'SIXT':      ['sixt'],
+    'AVIS':      ['avis'],
+    'THRIFTY':   ['thrifty'],
+    'DOLLAR':    ['dollar'],
+    'FOX':       ['fox'],
+    'PAYLESS':   ['payless'],
+    'EASIRENT':  ['easirent'],
+    'ALAMO':     ['alamo'],
+    'ADVANTAGE': ['advantage', 'advantag'],
+}
 
 def parse_f2_code(s):
-    """'*ENTERPRILGA' -> 'ENTERPRI' ; '*HERTZ   TUL' -> 'HERTZ'"""
     if not isinstance(s, str):
         return None
     s = s.strip().lstrip('*').strip()
     if not s:
         return None
     parts = s.split()
-    if len(parts) >= 2:
-        return parts[0]
-    return s[:-3] if len(s) > 3 else s   # trailing 3 chars = airport code
-
-f2_prefix = df2['city_agcy_disp_cd'].map(parse_f2_code)
-freq = f2_prefix.value_counts()
-print(len(freq), "distinct prefixes")
-print(freq.head(30))
-
-
-codes = np.array([c for c in f2_prefix.dropna().unique() if len(c) >= 3])
-print(len(codes), "codes to cluster")
-
-sim  = process.cdist(codes, codes, scorer=JaroWinkler.similarity, workers=-1)
-dist = 1.0 - sim
-
-for t in [0.08, 0.10, 0.12, 0.15, 0.20, 0.25]:
-    lab = AgglomerativeClustering(
-        n_clusters=None, distance_threshold=t,
-        metric='precomputed', linkage='average'
-    ).fit(dist).labels_
-    print(t, len(set(lab)))
-
-THRESHOLD = 0.15   # set from Cell 4
-
-labels = AgglomerativeClustering(
-    n_clusters=None, distance_threshold=THRESHOLD,
-    metric='precomputed', linkage='average'
-).fit(dist).labels_
-
-clusters = {}
-for code, lab in zip(codes, labels):
-    clusters.setdefault(lab, []).append(code)
-
-# canonical = longest member, tie-broken by frequency
-BRANDS = {}
-for members in clusters.values():
-    canon = max(members, key=lambda m: (len(m), freq.get(m, 0)))
-    BRANDS[canon.upper()] = sorted({m.lower() for m in members})
-
-order = sorted(BRANDS.items(),
-               key=lambda kv: -sum(freq.get(m.upper(), 0) for m in kv[1]))
-for k, v in order[:60]:
-    print(sum(freq.get(m.upper(), 0) for m in v), k, v)
-
+    return parts[0] if len(parts) >= 2 else (s[:-3] if len(s) > 3 else s)
 
 def to_brand(text):
     if not isinstance(text, str):
         return None
-    toks = re.sub(r'[^a-z]', ' ', text.lower()).split()
-    for tok in toks:
+    for tok in re.sub(r'[^a-z]', ' ', text.lower()).split():
         if len(tok) < 4:
             continue
         for canon, variants in BRANDS.items():
@@ -72,51 +38,13 @@ def to_brand(text):
                     return canon
     return None
 
-f2_brand_arr = f2_prefix.map(to_brand).to_numpy()
-r1_brand_arr = r1['vendordescription'].map(to_brand).to_numpy()
+# brand columns on both sides
+df2['f2_brand'] = df2['city_agcy_disp_cd'].map(parse_f2_code).map(to_brand)
+r1['f1_brand']  = r1['vendordescription'].map(to_brand)
 
-print("f2 unresolved:", pd.isna(f2_brand_arr).mean().round(4))
-print("f1 unresolved:", pd.isna(r1_brand_arr).mean().round(4))
-print(r1.loc[pd.isna(r1_brand_arr), 'vendordescription'].value_counts().head(30))
+f2_brand_arr = df2['f2_brand'].to_numpy()
 
-SRC = 'rows_date' if 'rows_date' in r1.columns else 'rows'
-
-def vendor_filter(b, rows):
-    if not rows:
-        return set()
-    if b is None:
-        return set(rows)      # unresolved file1 vendor -> pass through
-    return {r for r in rows if f2_brand_arr[r] == b}
-
-r1['f1_brand']      = r1_brand_arr
-r1['rows_vendor']   = [vendor_filter(b, rws) for b, rws in zip(r1_brand_arr, r1[SRC])]
-r1['n_cand_vendor'] = r1['rows_vendor'].map(len)
-r1['vendor_found']  = r1['n_cand_vendor'] > 0
-
-
-import ast
-
-def to_set(v):
-    if isinstance(v, (set, frozenset)):
-        return set(v)
-    if isinstance(v, (list, tuple)):
-        return set(v)
-    if isinstance(v, str):
-        v = v.strip()
-        if not v or v in ('set()', 'nan', '{}'):
-            return set()
-        try:
-            return {int(x) for x in ast.literal_eval(v)}
-        except Exception:
-            return {int(x) for x in re.findall(r'\d+', v)}
-    return set()
-
-r1['rows'] = r1['rows'].map(to_set)
-print(type(r1['rows'].iloc[0]), r1['rows'].map(len).sum())
-
-print("in :", r1[SRC].map(len).gt(0).sum())
-print("out:", r1['vendor_found'].sum())
-print(r1.loc[r1[SRC].map(len).gt(0) & ~r1['vendor_found'],
-             ['vendordescription', 'f1_brand']].head(20))
-
-
+print("f2 unresolved:", df2['f2_brand'].isna().mean().round(4))
+print("f1 unresolved (475 live):",
+      r1.loc[r1['rows_date'].map(len) > 0, 'f1_brand'].isna().mean().round(4))
+print(df2['f2_brand'].value_counts())
