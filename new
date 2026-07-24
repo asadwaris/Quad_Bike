@@ -58,3 +58,21 @@ pairs = pd.DataFrame([
     for _, r in live.iterrows() for c in r['rows_date']
 ])
 print(pd.crosstab(pairs['f1_brand'].fillna('NONE'), pairs['f2_brand'].fillna('NONE')))
+
+
+def vendor_filter(b, rows):
+    if not rows:
+        return set()
+    if b is None:
+        return set(rows)          # f1 brand unresolved -> keep all, decide later
+    return {r for r in rows if f2_brand_arr[r] == b}
+
+r1['rows_vendor']   = [vendor_filter(b, rws) for b, rws in zip(r1['f1_brand'], r1['rows_date'])]
+r1['n_cand_vendor'] = r1['rows_vendor'].map(len)
+r1['vendor_found']  = r1['n_cand_vendor'] > 0
+
+print(r1['date_found'].sum(), "->", r1['vendor_found'].sum())
+
+died = r1[r1['date_found'] & ~r1['vendor_found']]
+print(len(died))
+print(died[['vendordescription', 'f1_brand', 'n_cand_date']].head(20))
