@@ -93,6 +93,27 @@ r1['rows_vendor']   = [vendor_filter(b, rws) for b, rws in zip(r1_brand_arr, r1[
 r1['n_cand_vendor'] = r1['rows_vendor'].map(len)
 r1['vendor_found']  = r1['n_cand_vendor'] > 0
 
+
+import ast
+
+def to_set(v):
+    if isinstance(v, (set, frozenset)):
+        return set(v)
+    if isinstance(v, (list, tuple)):
+        return set(v)
+    if isinstance(v, str):
+        v = v.strip()
+        if not v or v in ('set()', 'nan', '{}'):
+            return set()
+        try:
+            return {int(x) for x in ast.literal_eval(v)}
+        except Exception:
+            return {int(x) for x in re.findall(r'\d+', v)}
+    return set()
+
+r1['rows'] = r1['rows'].map(to_set)
+print(type(r1['rows'].iloc[0]), r1['rows'].map(len).sum())
+
 print("in :", r1[SRC].map(len).gt(0).sum())
 print("out:", r1['vendor_found'].sum())
 print(r1.loc[r1[SRC].map(len).gt(0) & ~r1['vendor_found'],
