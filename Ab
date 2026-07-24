@@ -103,3 +103,32 @@ print('review flagged:', r1['review'].sum())
 # manual check ke liye samples
 r1[r1['method'].isin(['prefix','fuzzy'])] \
   .drop_duplicates(F1_NAME_COL)[[F1_NAME_COL,'method','n_cand']].head(30)
+
+
+
+
+# STEP 1: fast index (pehle wala script) — r1 mein 'found', 'method' aa chuke
+# STEP 2: sirf false wale nikalo
+
+failed = r1.loc[~r1['found'], F1_NAME_COL].dropna().unique()
+print(len(failed), 'names to brute force')
+
+brute = []
+for n, nm in enumerate(failed, 1):
+    res = lookup(nm)              # brute force wala lookup
+    res[F1_NAME_COL] = nm
+    brute.append(res)
+    if n % 50 == 0:
+        print(f'{n}/{len(failed)}', flush=True)
+
+bdf = pd.DataFrame(brute)
+bdf['method'] = bdf['method'].where(bdf['method'].isna(), 'brute_' + bdf['method'].astype(str))
+
+# STEP 3: wapas merge
+r1 = r1.merge(bdf, on=F1_NAME_COL, how='left', suffixes=('', '_b'))
+fill = r1['found_b'].fillna(False)
+for c in ['found', 'rows', 'n_cand', 'method']:
+    r1[c] = r1[c].where(~fill, r1[c + '_b'])
+r1 = r1.drop(columns=[c + '_b' for c in ['found', 'rows', 'n_cand', 'method']])
+
+print(r1.groupby(['found', 'method'], dropna=False).size())
