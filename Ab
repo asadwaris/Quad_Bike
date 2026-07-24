@@ -1,39 +1,105 @@
 import pandas as pd, re
 from collections import defaultdict
+from rapidfuzz import process, fuzz
 
-STOP = {'mr','mrs','ms','dr','md','jr','sr','ii','iii','the'}
+# ---------------- config ----------------
+F1_NAME_COL   = 'owner_name'
+F2_FULL       = 'full_name'
+F2_FIRST      = 'first_name'
+F2_LAST       = 'last_name'
+RANK_COL      = 'rank'
+FUZZY_CUTOFF  = 90
+MIN_LEN       = 4          # prefix/fuzzy sirf itne lambe tokens pe
+STOP = {'mr','mrs','ms','dr','md','jr','sr','ii','iii','the','s','o','w'}
 
+# ---------------- normalize ----------------
 def norm_tokens(s):
     if pd.isna(s): return []
     s = re.sub(r'[^a-z\s]', ' ', str(s).lower())
     return [t for t in s.split() if len(t) > 1 and t not in STOP]
 
-# ---- build index from file 2 ----
-# full name = fullname col, plus first+last as fallback
-f2_name = (df2['full_name'].fillna('') + ' ' +
-           df2['first_name'].fillna('') + ' ' +
-           df2['last_name'].fillna(''))
+# ---------------- build index from file 2 ----------------
+f2_name = (df2[F2_FULL].fillna('') + ' ' +
+           df2[F2_FIRST].fillna('') + ' ' +
+           df2[F2_LAST].fillna(''))
 
 index = defaultdict(set)
-for i, name in enumerate(f2_name):
-    for t in set(norm_tokens(name)):
+for i, nm in enumerate(f2_name):
+    for t in set(norm_tokens(nm)):
         index[t].add(i)
 
-# ---- filter file 1, rank 1 only ----
-r1 = df1[df1['rank'] == 1].copy()
+all_tokens   = list(index.keys())
+long_tokens  = [t for t in all_tokens if len(t) >= MIN_LEN]
 
+# prefix bucket: pehle 4 char -> tokens
+pref_bucket = defaultdict(list)
+for t in long_tokens:
+    pref_bucket[t[:4]].append(t)
+
+# ---------------- token resolution ----------------
+def resolve_token(t):
+    """returns (row_set, method) or (None, None)"""
+    if t in index:
+        return index[t], 'exact'
+    if len(t) >= MIN_LEN:
+        cands = [x for x in pref_bucket.get(t[:4], [])
+                 if t.startswith(x) or x.startswith(t)]
+        if cands:
+            s = set()
+            for c in cands: s |= index[c]
+            return s, 'prefix'
+        m = process.extractOne(t, long_tokens, scorer=fuzz.ratio,
+                               score_cutoff=FUZZY_CUTOFF)
+        if m: return index[m[0]], 'fuzzy'
+    return None, None
+
+# ---------------- name lookup ----------------
 def lookup(name):
     toks = set(norm_tokens(name))
-    if not toks: return None
-    sets = [index.get(t) for t in toks]
-    if any(s is None for s in sets): return None      # koi token file2 me hai hi nahi
-    sets.sort(key=len)                                 # rarest token pehle
-    hits = set(sets[0])
-    for s in sets[1:]:
-        hits &= s
-        if not hits: return None
-    return hits
+    if not toks:
+        return {'found': False, 'rows': None, 'n_cand': 0,
+                'method': None, 'review': False}
 
-r1['f2_rows'] = r1['owner_name'].map(lookup)
-r1['found']   = r1['f2_rows'].notna()
-r1['n_cand']  = r1['f2_rows'].map(lambda x: len(x) if x else 0)
+    sets, methods = [], []
+    for t in toks:
+        s, m = resolve_token(t)
+        if s is None:
+            return {'found': False, 'rows': None, 'n_cand': 0,
+                    'method': 'token_miss', 'review': False}
+        sets.append(s); methods.append(m)
+
+    order = sorted(range(len(sets)), key=lambda i: len(sets[i]))
+    hits = set(sets[order[0]])
+    for i in order[1:]:
+        hits &= sets[i]
+        if not hits:
+            return {'found': False, 'rows': None, 'n_cand': 0,
+                    'method': 'no_intersection', 'review': False}
+
+    # method priority: exact < prefix < fuzzy
+    if all(m == 'exact' for m in methods):      final = 'exact'
+    elif any(m == 'fuzzy' for m in methods):    final = 'fuzzy'
+    else:                                       final = 'prefix'
+
+    # guard: kam se kam ek token exact hona chahiye
+    review = ('exact' not in methods)
+
+    return {'found': True, 'rows': hits, 'n_cand': len(hits),
+            'method': final, 'review': review}
+
+# ---------------- run on rank 1, deduped ----------------
+r1 = df1[df1[RANK_COL] == 1].copy()
+
+uniq = pd.DataFrame({F1_NAME_COL: r1[F1_NAME_COL].dropna().unique()})
+uniq = uniq.join(pd.DataFrame(list(uniq[F1_NAME_COL].map(lookup))))
+
+r1 = r1.merge(uniq, on=F1_NAME_COL, how='left')
+r1['found'] = r1['found'].fillna(False)
+
+# ---------------- audit ----------------
+print(r1.groupby(['found','method'], dropna=False).size())
+print('review flagged:', r1['review'].sum())
+
+# manual check ke liye samples
+r1[r1['method'].isin(['prefix','fuzzy'])] \
+  .drop_duplicates(F1_NAME_COL)[[F1_NAME_COL,'method','n_cand']].head(30)
