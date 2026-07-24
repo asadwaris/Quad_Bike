@@ -199,3 +199,26 @@ r1 = r1.drop(columns=[c for c in r1.columns if c.endswith('_b')])
 
 print(r1['found'].value_counts())
 r1.loc[r1['method'] == 'brute'].drop_duplicates(F1_NAME_COL)[[F1_NAME_COL, 'n_cand', 'score']].head(30)
+
+
+date
+AMOUNT_BUFFER = 0.01  # stage 3
+
+f2_date = pd.to_datetime(df2['inv_date'], errors='coerce').dt.normalize()
+f1_date = pd.to_datetime(df1['transaction_date'], errors='coerce').dt.normalize()
+
+f2_date_arr = f2_date.to_numpy()  # positional lookup, matches row indices in `rows`
+
+def date_filter(idx, rows):
+    if not rows:
+        return set()
+    d = f1_date.iat[idx]
+    if pd.isna(d):
+        return set()
+    return {r for r in rows if f2_date_arr[r] == d}
+
+r1['rows_date'] = [
+    date_filter(i, rws) for i, rws in zip(r1['f1_pos'], r1['rows'])
+]
+r1['date_found'] = r1['rows_date'].str.len() > 0
+r1['n_cand_date'] = r1['rows_date'].str.len()
