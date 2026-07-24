@@ -48,3 +48,13 @@ print("f2 unresolved:", df2['f2_brand'].isna().mean().round(4))
 print("f1 unresolved (475 live):",
       r1.loc[r1['rows_date'].map(len) > 0, 'f1_brand'].isna().mean().round(4))
 print(df2['f2_brand'].value_counts())
+
+
+
+live = r1[r1['rows_date'].map(len) > 0]
+pairs = pd.DataFrame([
+    {'f1_vend': r['vendordescription'], 'f1_brand': r['f1_brand'],
+     'f2_code': df2['city_agcy_disp_cd'].iat[c], 'f2_brand': f2_brand_arr[c]}
+    for _, r in live.iterrows() for c in r['rows_date']
+])
+print(pd.crosstab(pairs['f1_brand'].fillna('NONE'), pairs['f2_brand'].fillna('NONE')))
