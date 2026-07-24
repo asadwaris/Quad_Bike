@@ -132,3 +132,70 @@ for c in ['found', 'rows', 'n_cand', 'method']:
 r1 = r1.drop(columns=[c + '_b' for c in ['found', 'rows', 'n_cand', 'method']])
 
 print(r1.groupby(['found', 'method'], dropna=False).size())
+
+
+
+
+new
+
+import pandas as pd, re
+from rapidfuzz import fuzz
+
+# ---- file2 ko ek baar prepare karo ----
+f2_rows = []
+for full, first, last in zip(df2[F2_FULL], df2[F2_FIRST], df2[F2_LAST]):
+    toks = set(norm_tokens(full)) | set(norm_tokens(first)) | set(norm_tokens(last))
+    blob = ''.join(sorted(toks))
+    f2_rows.append((toks, blob, ''.join(norm_tokens(full))))
+
+def tok_hit(t, toks, blob, fullcat):
+    if t in toks: return 3                      # exact
+    if len(t) < 4: return 0
+    for x in toks:
+        if len(x) < 4: continue
+        if t.startswith(x) or x.startswith(t): return 2      # truncation
+        if common_prefix_len(t, x) >= 5: return 2            # gopal / gopalakrishnan
+        if fuzz.ratio(t, x) >= 88: return 1                  # typo
+    if t in blob or t in fullcat: return 2                   # concatenated
+    if fuzz.partial_ratio(t, fullcat) >= 92: return 1
+    return 0
+
+def brute_lookup(name):
+    toks = norm_tokens(name)
+    if not toks:
+        return {'found': False, 'rows': None, 'n_cand': 0, 'score': 0}
+    hits, best = [], 0
+    for i, (t2, blob, fullcat) in enumerate(f2_rows):
+        scores = [tok_hit(t, t2, blob, fullcat) for t in toks]
+        if 0 in scores: continue
+        s = sum(scores) / len(scores)
+        hits.append(i); best = max(best, s)
+    if not hits:
+        return {'found': False, 'rows': None, 'n_cand': 0, 'score': 0}
+    return {'found': True, 'rows': set(hits), 'n_cand': len(hits), 'score': round(best, 2)}
+
+# ---- sirf failed names pe ----
+failed = r1.loc[~r1['found'], F1_NAME_COL].dropna().unique()
+print(len(failed), 'to process')
+
+out = []
+for n, nm in enumerate(failed, 1):
+    r = brute_lookup(nm); r[F1_NAME_COL] = nm
+    out.append(r)
+    if n % 25 == 0: print(n, '/', len(failed), flush=True)
+
+bdf = pd.DataFrame(out)
+bdf['method'] = 'brute'
+
+# ---- merge back ----
+r1 = r1.drop(columns=[c for c in r1.columns if c.endswith('_b')], errors='ignore')
+r1 = r1.merge(bdf, on=F1_NAME_COL, how='left', suffixes=('', '_b'))
+r1['found'] = r1['found'].fillna(False).astype(bool)
+fill = r1['found_b'].fillna(False).astype(bool)
+for c in ['found', 'rows', 'n_cand', 'method']:
+    r1[c] = r1[c].where(~fill, r1[c + '_b'])
+r1['score'] = r1.get('score_b')
+r1 = r1.drop(columns=[c for c in r1.columns if c.endswith('_b')])
+
+print(r1['found'].value_counts())
+r1.loc[r1['method'] == 'brute'].drop_duplicates(F1_NAME_COL)[[F1_NAME_COL, 'n_cand', 'score']].head(30)
