@@ -222,3 +222,16 @@ r1['rows_date'] = [
 ]
 r1['date_found'] = r1['rows_date'].str.len() > 0
 r1['n_cand_date'] = r1['rows_date'].str.len()
+
+
+f2_date_arr = pd.to_datetime(df2['inv_dt'], errors='coerce').dt.normalize().to_numpy()
+r1_date_arr = pd.to_datetime(r1['transactiondate'], errors='coerce').dt.normalize().to_numpy()
+
+def date_filter(d, rows):
+    if not rows or pd.isna(d):
+        return set()
+    return {r for r in rows if f2_date_arr[r] == d}
+
+r1['rows_date']    = [date_filter(d, rws) for d, rws in zip(r1_date_arr, r1['rows'])]
+r1['n_cand_date']  = r1['rows_date'].map(len)
+r1['date_found']   = r1['n_cand_date'] > 0
