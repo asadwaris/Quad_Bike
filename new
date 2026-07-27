@@ -122,3 +122,18 @@ r1['match'] = [emb_match(e, rws) for e, rws in zip(r1['emb'], r1['rows_amount'])
 
 print(r1['amount_found'].sum(), "candidates ->", r1['match'].sum(), "matched")
 print(r1.loc[r1['amount_found'], ['emb', 'n_cand_amount', 'match']])
+
+
+
+
+f2_emb_arr = df2['emb'].to_numpy()
+
+def pull_f2_emb(rows):
+    if not rows:
+        return None
+    vals = [f2_emb_arr[r] for r in rows]
+    return vals[0] if len(vals) == 1 else vals   # single -> scalar, multiple -> list
+
+r1['f2_emb'] = r1['rows_amount'].map(pull_f2_emb)
+
+print(r1.loc[r1['amount_found'], ['emb', 'f2_emb', 'n_cand_amount']])
