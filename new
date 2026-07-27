@@ -76,3 +76,34 @@ print(r1['date_found'].sum(), "->", r1['vendor_found'].sum())
 died = r1[r1['date_found'] & ~r1['vendor_found']]
 print(len(died))
 print(died[['vendordescription', 'f1_brand', 'n_cand_date']].head(20))
+AMOUNT_BUFFER = 5.0
+
+f2_brand_arr = df2['vendor'].to_numpy()
+f2_amt_arr   = pd.to_numeric(df2['amount'], errors='coerce').to_numpy()   # fix if amount col differs
+r1_amt_arr   = pd.to_numeric(r1['total_approved_amount'], errors='coerce').to_numpy()
+
+# --- vendor: read rows_date ---
+def vendor_filter(b, rows):
+    if not rows:
+        return set()
+    if pd.isna(b):
+        return set(rows)
+    return {r for r in rows if f2_brand_arr[r] == b}
+
+r1['rows_vendor']   = [vendor_filter(b, rws) for b, rws in zip(r1['vendor'], r1['rows_date'])]
+r1['n_cand_vendor'] = r1['rows_vendor'].map(len)
+r1['vendor_found']  = r1['n_cand_vendor'] > 0
+
+# --- amount: read rows_vendor ---
+def amount_filter(a, rows):
+    if not rows or pd.isna(a):
+        return set()
+    return {r for r in rows if not pd.isna(f2_amt_arr[r]) and abs(f2_amt_arr[r] - a) <= AMOUNT_BUFFER}
+
+r1['rows_amount']   = [amount_filter(a, rws) for a, rws in zip(r1_amt_arr, r1['rows_vendor'])]
+r1['n_cand_amount'] = r1['rows_amount'].map(len)
+r1['amount_found']  = r1['n_cand_amount'] > 0
+
+print("date  :", r1['date_found'].sum())
+print("vendor:", r1['vendor_found'].sum())
+print("amount:", r1['amount_found'].sum())
