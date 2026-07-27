@@ -137,3 +137,11 @@ def pull_f2_emb(rows):
 r1['f2_emb'] = r1['rows_amount'].map(pull_f2_emb)
 
 print(r1.loc[r1['amount_found'], ['emb', 'f2_emb', 'n_cand_amount']])
+
+
+
+Hi Mayank,
+Please find the results attached. Quick summary of the approach:
+We started by filtering on name from the source data, then applied an exact match on invoice date. After that we matched on vendor, followed by amount with a $5 buffer.
+The CSV is attached — do let me know if anything needs to be adjusted or if you have any suggestions.
+Thanks
