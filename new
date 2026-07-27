@@ -107,3 +107,18 @@ r1['amount_found']  = r1['n_cand_amount'] > 0
 print("date  :", r1['date_found'].sum())
 print("vendor:", r1['vendor_found'].sum())
 print("amount:", r1['amount_found'].sum())
+
+
+
+
+f2_emb_arr = df2['emb'].to_numpy()
+
+def emb_match(e, rows):
+    if not rows:
+        return False
+    return any(f2_emb_arr[r] == e for r in rows)
+
+r1['match'] = [emb_match(e, rws) for e, rws in zip(r1['emb'], r1['rows_amount'])]
+
+print(r1['amount_found'].sum(), "candidates ->", r1['match'].sum(), "matched")
+print(r1.loc[r1['amount_found'], ['emb', 'n_cand_amount', 'match']])
