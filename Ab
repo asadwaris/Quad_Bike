@@ -50,3 +50,57 @@ result['match'] = [
 # ---- audit ----
 print(result['match'].value_counts())
 print(result[[F1_NAME_COL, F2_FULL_COL, 'match']].head(30))
+
+
+
+
+import pandas as pd
+import re
+from rapidfuzz import fuzz
+
+# ---- config ----
+F1_NAME_COL = 'ownername'
+F2_FULL_COL = 'source_pass_full_nm'
+
+STOP = {'mr','mrs','ms','dr','md','jr','sr','ii','iii','the','s','o','w'}
+FUZZ_CUTOFF = 85   # typo tolerance (alegria vs ealegria)
+
+# ---- normalize ----
+def norm_tokens(s):
+    if pd.isna(s):
+        return []
+    s = re.sub(r'[^a-z\s]', ' ', str(s).lower())
+    return [t for t in s.split() if len(t) > 1 and t not in STOP]
+
+# ---- ek token doosre se "match" karta hai kya ----
+def tok_hit(t, others):
+    for x in others:
+        if t == x:                                   # exact
+            return True
+        if len(t) < 4 or len(x) < 4:
+            continue
+        if t.startswith(x) or x.startswith(t):       # truncation
+            return True
+        if x.endswith(t) or t.endswith(x):           # embedded suffix (oseran in rossoseran)
+            return True
+        if fuzz.ratio(t, x) >= FUZZ_CUTOFF:          # typo (alegria/ealegria)
+            return True
+    return False
+
+# ---- row-wise match ----
+def row_match(a, b):
+    ta, tb = norm_tokens(a), norm_tokens(b)
+    if not ta or not tb:
+        return False
+    small, big = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+    # har chota-side token ko bade side mein hit milna chahiye
+    return all(tok_hit(t, big) for t in small)
+
+result['match'] = [
+    row_match(a, b)
+    for a, b in zip(result[F1_NAME_COL], result[F2_FULL_COL])
+]
+
+# ---- audit ----
+print(result['match'].value_counts())
+print(result[[F1_NAME_COL, F2_FULL_COL, 'match']].head(30))
