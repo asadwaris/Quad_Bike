@@ -104,3 +104,25 @@ result['match'] = [
 # ---- audit ----
 print(result['match'].value_counts())
 print(result[[F1_NAME_COL, F2_FULL_COL, 'match']].head(30))
+
+
+
+
+def date_ok(row):
+    d = row['transactiondate']
+    if pd.isna(d):
+        return False
+    d = pd.Timestamp(d).normalize()
+    # 1. exact vs source invoice date
+    inv = pd.Timestamp(row['source_inv_dt']).normalize() if not pd.isna(row['source_inv_dt']) else pd.NaT
+    if inv is not pd.NaT and d == inv:
+        return True
+    # 2. fallback: within rent->return window
+    s = pd.Timestamp(row['car_rent_dt']).normalize() if not pd.isna(row['car_rent_dt']) else pd.NaT
+    e = pd.Timestamp(row['car_rtrn_dt']).normalize() if not pd.isna(row['car_rtrn_dt']) else pd.NaT
+    if s is not pd.NaT and e is not pd.NaT and s <= d <= e:
+        return True
+    return False
+
+mask = result['match'] == True
+result.loc[mask, 'date_match'] = result[mask].apply(date_ok, axis=1)
