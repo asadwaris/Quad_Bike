@@ -21,3 +21,48 @@ def date_filter(d, rows):
 r1['rows_date']   = [date_filter(d, rws) for d, rws in zip(r1_date_arr, r1['rows'])]
 r1['n_cand_date'] = r1['rows_date'].map(len)
 r1['date_found']  = r1['n_cand_date'] > 0
+
+
+
+import json
+import re
+import boto3
+from functools import lru_cache
+
+# ----- Bedrock client (credentials env/config se lo, hardcode mat karo) -----
+_session_kwargs = dict(region_name=AWS_REGION)
+_bedrock = boto3.Session(**_session_kwargs).client("bedrock-runtime")
+
+# ----- Layer 1: normalize -----
+_NOISE = re.compile(
+    r"\b(car rental|car rentals|rent a car|rent-a-car|rentals?|inc|llc|ltd|"
+    r"pvt|private|limited|corp|corporation|company|co|holdings|group|the)\b"
+)
+
+def _norm(s):
+    if not isinstance(s, str):
+        return ""
+    s = s.lower()
+    s = re.sub(r"[^a-z0-9\s]", " ", s)   # punctuation -> space
+    s = _NOISE.sub(" ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def brute_match(txn_vendor, cand_vendor):
+    """
+    Returns: 'yes' (confident match), 'no' (confident reject), 'unsure' (send to LLM)
+    """
+    a, b = _norm(txn_vendor), _norm(cand_vendor)
+    if not a or not b:
+        return "unsure"
+    if a == b:
+        return "yes"
+    # bidirectional substring: "enterprise" vs "enterprise abc"
+    if a in b or b in a:
+        return "yes"
+    # token overlap: share a meaningful token (len>=4 to avoid "car","the")
+    ta = {t for t in a.split() if len(t) >= 4}
+    tb = {t for t in b.split() if len(t) >= 4}
+    if ta & tb:
+        return "yes"
+    return "unsure"   # no obvious relation -> let LLM decide (don't hard-reject)
