@@ -195,3 +195,16 @@ result = df1.merge(
 ).drop(columns=["id_in_file2"])   # drop duplicate key column
 
 result.to_excel("output.xlsx", index=False)
+
+
+
+
+source_dedup = source.drop_duplicates(subset="embedding_text", keep="first")
+
+result = df.merge(
+    source_dedup[["embedding_text", "car_rent_dt", "car_rtrn_dt"]],
+    left_on="gtdr_embedding_text",
+    right_on="embedding_text",
+    how="left",
+    suffixes=("", "_from_source")
+).drop(columns=["embedding_text_from_source"])
