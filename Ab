@@ -16,3 +16,37 @@ import ast
 parsed = result["gtdr_embedding_text"].apply(
     lambda x: ast.literal_eval(x) if pd.notna(x) else {}
 )
+
+
+import pandas as pd
+import re
+
+# ---- config ----
+F1_NAME_COL = 'ownername'
+F2_FULL_COL = 'source_pass_full_nm'
+
+STOP = {'mr','mrs','ms','dr','md','jr','sr','ii','iii','the','s','o','w'}
+
+# ---- normalize ----
+def norm_tokens(s):
+    if pd.isna(s):
+        return []
+    s = re.sub(r'[^a-z\s]', ' ', str(s).lower())
+    return [t for t in s.split() if len(t) > 1 and t not in STOP]
+
+# ---- row-wise match ----
+def row_match(a, b):
+    ta, tb = set(norm_tokens(a)), set(norm_tokens(b))
+    if not ta or not tb:
+        return False
+    return ta <= tb or tb <= ta        # subset match
+    # return ta == tb                  # <- strict equality ke liye ye line use kar, upar wali hata de
+
+result['match'] = [
+    row_match(a, b)
+    for a, b in zip(result[F1_NAME_COL], result[F2_FULL_COL])
+]
+
+# ---- audit ----
+print(result['match'].value_counts())
+print(result[[F1_NAME_COL, F2_FULL_COL, 'match']].head(30))
