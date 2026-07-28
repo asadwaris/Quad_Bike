@@ -66,3 +66,116 @@ def brute_match(txn_vendor, cand_vendor):
     if ta & tb:
         return "yes"
     return "unsure"   # no obvious relation -> let LLM decide (don't hard-reject)
+
+
+
+
+
+
+import os
+import json
+import re
+import boto3
+import pandas as pd
+from functools import lru_cache
+
+# ==================== CREDENTIALS (yahan bhar) ====================
+os.environ["AWS_ACCESS_KEY_ID"]     = "PASTE_ACCESS_KEY"
+os.environ["AWS_SECRET_ACCESS_KEY"] = "PASTE_SECRET_KEY"
+os.environ["AWS_SESSION_TOKEN"]     = "PASTE_SESSION_TOKEN"   # temporary creds hain to, warna ye line hata de
+
+# ==================== Config ====================
+AWS_REGION = "us-east-1"
+SUPERVISOR_MODEL_ID = "us.anthropic.claude-sonnet-4-20250514-v1:0"
+
+# COLUMN NAMES — apne actual columns daal
+TXN_VENDOR_COL  = "vendor"        # r1 me transaction ka vendor
+CAND_VENDOR_COL = "vendor_name"   # df2 me candidate ka vendor
+
+# ==================== Bedrock Client ====================
+bedrock = boto3.Session(region_name=AWS_REGION).client("bedrock-runtime")
+
+# ==================== LLM connectivity test ====================
+def quick_test():
+    body = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 10,
+        "temperature": 0,
+        "messages": [{"role": "user", "content": "Reply with exactly one word: OK"}],
+    }
+    resp = bedrock.invoke_model(modelId=SUPERVISOR_MODEL_ID, body=json.dumps(body))
+    out = json.loads(resp["body"].read())
+    print("LLM test response:", out["content"][0]["text"])
+
+quick_test()   # 'OK' aaya to Bedrock connected
+
+# ==================== Layer 1: Brute Force ====================
+_NOISE = re.compile(
+    r"\b(car rental|car rentals|rent a car|rent-a-car|rentals?|inc|llc|ltd|"
+    r"pvt|private|limited|corp|corporation|company|co|holdings|group|the)\b"
+)
+
+def _norm(s):
+    if not isinstance(s, str):
+        return ""
+    s = s.lower()
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = _NOISE.sub(" ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def brute_match(txn_vendor, cand_vendor):
+    """Returns 'yes' (confident) or 'unsure' (send to LLM)."""
+    a, b = _norm(txn_vendor), _norm(cand_vendor)
+    if not a or not b:
+        return "unsure"
+    if a == b:
+        return "yes"
+    if a in b or b in a:                      # "enterprise" in "enterprise abc"
+        return "yes"
+    ta = {t for t in a.split() if len(t) >= 4}
+    tb = {t for t in b.split() if len(t) >= 4}
+    if ta & tb:                               # shared meaningful token
+        return "yes"
+    return "unsure"
+
+# ==================== Layer 2: LLM ====================
+_PROMPT = """You are matching car rental vendor names. Two names may refer to the same company even if spelled differently, abbreviated, or with extra words (e.g. "Enterprise" and "Enterprise Rent-A-Car" are the SAME; "National" and "National Car Rental" are the SAME; "Hertz" and "Avis" are DIFFERENT).
+
+Transaction vendor: "{txn}"
+Candidate vendor: "{cand}"
+
+Do these refer to the same rental company? Answer with exactly one word: YES or NO."""
+
+@lru_cache(maxsize=20000)
+def llm_match(txn_vendor, cand_vendor):
+    body = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 5,
+        "temperature": 0,
+        "messages": [{"role": "user",
+                      "content": _PROMPT.format(txn=txn_vendor, cand=cand_vendor)}],
+    }
+    resp = bedrock.invoke_model(modelId=SUPERVISOR_MODEL_ID, body=json.dumps(body))
+    out = json.loads(resp["body"].read())
+    return out["content"][0]["text"].strip().lower().startswith("yes")
+
+def vendor_match(txn_vendor, cand_vendor):
+    if brute_match(txn_vendor, cand_vendor) == "yes":
+        return True
+    return llm_match(txn_vendor, cand_vendor)
+
+# ==================== Apply on date-matched rows ====================
+cand_vendor_arr = df2[CAND_VENDOR_COL].to_numpy()
+
+def vendor_filter(txn_vendor, date_rows):
+    if not date_rows or not isinstance(txn_vendor, str):
+        return set()
+    return {r for r in date_rows if vendor_match(txn_vendor, cand_vendor_arr[r])}
+
+r1['rows_vendor']   = [vendor_filter(v, rws)
+                       for v, rws in zip(r1[TXN_VENDOR_COL], r1['rows_date'])]
+r1['n_cand_vendor'] = r1['rows_vendor'].map(len)
+r1['vendor_found']  = r1['n_cand_vendor'] > 0
+
+print(r1['vendor_found'].value_counts())
