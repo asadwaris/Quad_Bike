@@ -179,3 +179,19 @@ r1['n_cand_vendor'] = r1['rows_vendor'].map(len)
 r1['vendor_found']  = r1['n_cand_vendor'] > 0
 
 print(r1['vendor_found'].value_counts())
+
+
+
+import pandas as pd
+
+df1 = pd.read_excel("file1.xlsx")   # file needing the dates
+df2 = pd.read_excel("file2.xlsx")   # file with start_date, end_date
+
+result = df1.merge(
+    df2[["id_in_file2", "start_date", "end_date"]],
+    left_on="id_in_file1",
+    right_on="id_in_file2",
+    how="left"
+).drop(columns=["id_in_file2"])   # drop duplicate key column
+
+result.to_excel("output.xlsx", index=False)
