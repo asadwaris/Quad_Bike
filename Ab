@@ -118,3 +118,43 @@ def lookup(name):
 
     return {'found': False, 'rows': None, 'n_cand': 0,
             'method': 'no_match', 'review': False, 'extra': None}
+
+
+
+
+
+import re, pandas as pd
+
+STOP = {'mr','mrs','ms','dr','md','jr','sr','ii','iii','the'}
+
+def owner_toks(s):
+    if pd.isna(s): return []
+    return [t for t in re.sub(r'[^a-z]', ' ', str(s).lower()).split()
+            if len(t) > 1 and t not in STOP]
+
+def squash(s):
+    return '' if pd.isna(s) else re.sub(r'[^a-z]', '', str(s).lower())
+
+def check(owner, name):
+    toks = owner_toks(owner)
+    c = squash(name)
+    if not toks or not c:
+        return False, 'empty'
+    first = toks[0]
+    if not c.startswith(first):
+        return False, 'first_mismatch'
+    pos = 0
+    for t in toks:
+        j = c.find(t, pos)
+        if j == -1:
+            return False, 'no_match'
+        pos = j + len(t)
+    if c == ''.join(toks):
+        return True, 'exact'
+    return True, ('trailing_extra' if pos == len(c) else 'inner_extra')
+
+df = pd.read_csv('name.csv')
+df['my_found'], df['my_method'] = zip(*df.apply(
+    lambda r: check(r['ownername'], r['name']), axis=1))
+
+print(df[['ownername','name','Match','my_found','my_method']].to_string())
