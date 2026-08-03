@@ -1,152 +1,38 @@
 # ============================================================
-# CELL 1 — setup
-# ============================================================
-import time
-import pandas as pd
-from tqdm.auto import tqdm
-
-tqdm.pandas()
-
-# apne actual paths daal do
-# df     = pd.read_csv('output.csv')      # ~600 rows
-# source = pd.read_csv('source.csv')      # ~300k rows
-
-OWNER_COL = 'ownername'    # df me owner ka column
-FULL_COL  = 'full_name'    # source me full name ka column
-
-# index labels aur positions same rahen — baad me .loc safe rahega
-source = source.reset_index(drop=True)
-df     = df.reset_index(drop=True)
-
-print('df   :', df.shape)
-print('source:', source.shape)
-
-# ============================================================
-# CELL 2 — source ko ek hi baar squash karo (ye sabse important step hai)
-# ============================================================
-t0 = time.time()
-
-src_sq = source[FULL_COL].fillna('').map(squash)
-src_sq = src_sq[src_sq != '']                      # khali/junk rows nikal do
-
-print(f'squashed {len(src_sq):,} source rows in {time.time()-t0:.1f}s')
-print(f'dropped  {len(source) - len(src_sq):,} empty rows')
-src_sq.head()
-
-
-# ============================================================
-# CELL 3 — matching logic
+# CELL 7 — date columns ko datetime banao (dono taraf)
 # ============================================================
 
-def match_toks(toks, c):
-    """tumhare check() ka core — sirf boolean, ordered subsequence containment"""
-    pos = 0
-    for t in toks:
-        j = c.find(t, pos)
-        if j == -1:
-            return False
-        pos = j + len(t)
-    return True
+# --- apne actual column names yahan daal do ---
+DF_IN   = 'hotel_in_date'
+DF_OUT  = 'hotel_out_date'
+SRC_IN  = 'checkin_date'
+SRC_OUT = 'checkout_date'
 
+# yyyy-mm-dd -> datetime (invalid -> NaT)
+df[DF_IN]      = pd.to_datetime(df[DF_IN],      format='%Y-%m-%d', errors='coerce')
+df[DF_OUT]     = pd.to_datetime(df[DF_OUT],     format='%Y-%m-%d', errors='coerce')
+source[SRC_IN]  = pd.to_datetime(source[SRC_IN],  format='%Y-%m-%d', errors='coerce')
+source[SRC_OUT] = pd.to_datetime(source[SRC_OUT], format='%Y-%m-%d', errors='coerce')
 
-def find_rows(owner):
-    """owner ke liye saare matching source index labels"""
-    toks = owner_toks(owner)
-    if not toks:
-        return []
-    key  = max(toks, key=len)                      # sabse selective token se prefilter
-    cand = src_sq[src_sq.str.contains(key, regex=False)]
-    return [i for i, c in cand.items() if match_toks(toks, c)]
-
-
-# sanity check — ek known naam pe manually verify karo
-test_owner = df[OWNER_COL].iloc[0]
-r = find_rows(test_owner)
-print('owner :', test_owner)
-print('toks  :', owner_toks(test_owner))
-print('hits  :', len(r))
-source.loc[r[:10], [FULL_COL]] if r else print('no match')
-
+# NaT check — agar yahan count zyada hai to format/data issue hai
+print('df   NaT  :', df[DF_IN].isna().sum(),  df[DF_OUT].isna().sum())
+print('source NaT:', source[SRC_IN].isna().sum(), source[SRC_OUT].isna().sum())
 
 # ============================================================
-# CELL 4 — SAMPLE RUN (25 rows) + timing extrapolation
+# CELL 8 — date filter: sirf n_rows > 0 wali rows pe
 # ============================================================
-N = 25
-sample = df.head(N).copy()
-
-t0 = time.time()
-sample['rows'] = [find_rows(o) for o in tqdm(sample[OWNER_COL], desc='sample')]
-elapsed = time.time() - t0
-
-sample['n_rows'] = sample['rows'].str.len()
-
-print(f'\n{N} rows -> {elapsed:.1f}s  ({elapsed/N:.2f}s per row)')
-print(f'full {len(df)} rows ka estimate: {elapsed/N*len(df)/60:.1f} min\n')
-
-print(sample['n_rows'].describe())
-print('\nzero matches :', (sample['n_rows'] == 0).sum())
-print('50+ matches  :', (sample['n_rows'] >= 50).sum())
-
-sample[[OWNER_COL, 'n_rows']].head(25)
-
-
-# ============================================================
-# CELL 5 — spot check: 3 random samples manually verify karo
-# ============================================================
-for _, r in sample[sample['n_rows'] > 0].sample(min(3, (sample['n_rows']>0).sum()), random_state=1).iterrows():
-    print('=' * 70)
-    print('OWNER:', r[OWNER_COL], '| toks:', owner_toks(r[OWNER_COL]), '| hits:', r['n_rows'])
-    print(source.loc[r['rows'][:5], FULL_COL].to_string())
-
-
-# ============================================================
-# CELL 6 — FULL RUN
-# ============================================================
-t0 = time.time()
-df['rows'] = [find_rows(o) for o in tqdm(df[OWNER_COL], desc='full name match')]
-print(f'\ndone in {(time.time()-t0)/60:.1f} min')
-
-df['n_rows'] = df['rows'].str.len()
-
-print('\n--- summary ---')
-print(f'total df rows      : {len(df)}')
-print(f'with >=1 match     : {(df["n_rows"] > 0).sum()}')
-print(f'with 0 matches     : {(df["n_rows"] == 0).sum()}')
-print(f'total candidate rows: {df["n_rows"].sum():,}')
-print(df['n_rows'].describe())
-
-
-
-# ============================================================
-# CELL 7 — save (pickle, kyunki list column CSV me string ban jaata hai)
-# ============================================================
-df.to_pickle('df_rows.pkl')
-print('saved -> df_rows.pkl')
-
-# audit ke liye readable copy chahiye to alag se:
-df.drop(columns=['rows']).to_csv('df_rows_summary.csv', index=False)
-
-# baad me load:
-# df = pd.read_pickle('df_rows.pkl')
-
-
-# ============================================================
-# CELL 8 — zero-match rows inspect karo (yahi debug ka asli kaam hai)
-# ============================================================
-zero = df[df['n_rows'] == 0]
-print(f'{len(zero)} owners ka koi match nahi\n')
-
-for o in zero[OWNER_COL].head(15):
-    print(f'{o!r:45} -> toks: {owner_toks(o)}')
-
-
-
 def filter_date(r):
-    if not r['rows']:
+    if not r['rows']:                       # 0-match rows chhod do
         return []
     sub  = source.loc[r['rows']]
-    keep = (sub['date'] >= r['from_date']) & (sub['date'] <= r['to_date'])
+    keep = (sub[SRC_IN] == r[DF_IN]) & (sub[SRC_OUT] == r[DF_OUT])
     return sub.index[keep].tolist()
 
-df['rows_date'] = df.progress_apply(filter_date, axis=1)
+df['rows_date']   = df.progress_apply(filter_date, axis=1)
 df['n_rows_date'] = df['rows_date'].str.len()
+
+print('--- date filter summary ---')
+print(f'name-matched rows (n_rows>0)   : {(df["n_rows"] > 0).sum()}')
+print(f'survived date filter (>0)      : {(df["n_rows_date"] > 0).sum()}')
+print(f'total candidate rows after date: {df["n_rows_date"].sum():,}')
+print(df.loc[df['n_rows'] > 0, 'n_rows_date'].describe())
