@@ -1,160 +1,152 @@
-import re, pandas as pd
-from collections import defaultdict
+# ============================================================
+# CELL 1 — setup
+# ============================================================
+import time
+import pandas as pd
+from tqdm.auto import tqdm
 
-STOP = {'mr','mrs','ms','dr','md','jr','sr','ii','iii','the'}
+tqdm.pandas()
 
-def owner_toks(s):
-    if pd.isna(s): return []
-    return [t for t in re.sub(r'[^a-z]', ' ', str(s).lower()).split()
-            if len(t) > 1 and t not in STOP]
+# apne actual paths daal do
+# df     = pd.read_csv('output.csv')      # ~600 rows
+# source = pd.read_csv('source.csv')      # ~300k rows
 
-def squash(s):
-    return '' if pd.isna(s) else re.sub(r'[^a-z]', '', str(s).lower())
+OWNER_COL = 'ownername'    # df me owner ka column
+FULL_COL  = 'full_name'    # source me full name ka column
 
-# ---------- build candidate strings from file2 ----------
-cands = []                      # (df2_row_index, candidate_string)
-for i, (full, first, last) in enumerate(zip(df2[F2_FULL], df2[F2_FIRST], df2[F2_LAST])):
-    for f in {squash(full), squash(first) + squash(last)}:
-        if len(f) >= 4:
-            cands.append((i, f))
+# index labels aur positions same rahen — baad me .loc safe rahega
+source = source.reset_index(drop=True)
+df     = df.reset_index(drop=True)
 
-pref_idx, suf_idx = defaultdict(list), defaultdict(list)
-for k, (i, c) in enumerate(cands):
-    pref_idx[c[:4]].append(k)
-    suf_idx[c[-4:]].append(k)
+print('df   :', df.shape)
+print('source:', source.shape)
 
-def _pool(idx, t, head=True):
-    if len(t) >= 4:
-        return set(idx.get(t[:4] if head else t[-4:], []))
-    return {k for key, ks in idx.items()
-            if (key.startswith(t) if head else key.endswith(t)) for k in ks}
+# ============================================================
+# CELL 2 — source ko ek hi baar squash karo (ye sabse important step hai)
+# ============================================================
+t0 = time.time()
 
-# ---------- core rule ----------
-def ordered_contains(c, toks):
-    pos = 0
-    for t in toks:
-        j = c.find(t, pos)
-        if j == -1: return False
-        pos = j + len(t)
-    return True
+src_sq = source[FULL_COL].fillna('').map(squash)
+src_sq = src_sq[src_sq != '']                      # khali/junk rows nikal do
 
-def lookup(name):
-    toks = owner_toks(name)
-    if not toks:
-        return {'found': False, 'rows': None, 'n_cand': 0, 'method': None, 'review': False}
-
-    first, last = toks[0], toks[-1]
-    pool = _pool(pref_idx, first, True) & _pool(suf_idx, last, False)
-    target = ''.join(toks)
-
-    exact, strict = set(), set()
-    for k in pool:
-        i, c = cands[k]
-        if not (c.startswith(first) and c.endswith(last)): continue
-        if not ordered_contains(c, toks): continue
-        (exact if c == target else strict).add(i)
-
-    hits = exact or strict
-    if not hits:
-        return {'found': False, 'rows': None, 'n_cand': 0, 'method': 'no_match', 'review': False}
-    return {'found': True, 'rows': hits, 'n_cand': len(hits),
-            'method': 'exact' if exact else 'middle_name',
-            'review': len(toks) == 1 or len(hits) > 1}
+print(f'squashed {len(src_sq):,} source rows in {time.time()-t0:.1f}s')
+print(f'dropped  {len(source) - len(src_sq):,} empty rows')
+src_sq.head()
 
 
-r1 = df1[df1[RANK_COL] == 1].copy()
-uniq = pd.DataFrame({F1_NAME_COL: r1[F1_NAME_COL].dropna().unique()})
-uniq = uniq.join(pd.DataFrame(list(uniq[F1_NAME_COL].map(lookup))))
-r1 = r1.merge(uniq, on=F1_NAME_COL, how='left')
-r1['found'] = r1['found'].fillna(False)
-print(r1.groupby(['found','method'], dropna=False).size())
+# ============================================================
+# CELL 3 — matching logic
+# ============================================================
 
-
-for nm in ['Spencer Jensen','WILLIAM CARROLL','BRIAN KOOMAN','DAVID PRESS',
-           'APRIL UNSELL','KEVIN PLANTE','CHRISTOPHER WARNER','MELISSA BURKUS',
-           'CHRISTOPHER OSUCH','STEPHEN ALLEN','JENNIFER COOPER','MELISSA GERMAIN']:
-    r = lookup(nm)
-    print(nm, '->', r['found'], r['method'], r['n_cand'])
-
-
-
-def lookup(name):
-    toks = owner_toks(name)
-    if not toks:
-        return {'found': False, 'rows': None, 'n_cand': 0,
-                'method': None, 'review': False, 'extra': None}
-
-    first, last = toks[0], toks[-1]
-    target = ''.join(toks)
-    pool = _pool(pref_idx, first, True)          # only anchor the search, not the match
-    if len(toks) > 1:
-        pool |= {k for k in range(len(cands)) if False}   # no-op; keep pool = first-anchored
-
-    tiers = {0: set(), 1: set(), 2: set()}
-    extras = {}
-    for k in pool:
-        i, c = cands[k]
-        if not c.startswith(first):
-            continue
-        pos, ok = 0, True
-        for t in toks:
-            j = c.find(t, pos)
-            if j == -1: ok = False; break
-            pos = j + len(t)
-        if not ok:
-            continue
-        tail = len(c) - pos                       # chars left after the last name
-        tier = 0 if c == target else (1 if tail == 0 else 2)
-        tiers[tier].add(i)
-        extras.setdefault(i, c[pos:])
-
-    for tier, label in [(0, 'exact'), (1, 'inner_extra'), (2, 'trailing_extra')]:
-        if tiers[tier]:
-            hits = tiers[tier]
-            return {'found': True, 'rows': hits, 'n_cand': len(hits),
-                    'method': label,
-                    'review': tier == 2 or len(hits) > 1 or len(toks) == 1,
-                    'extra': sorted({extras[i] for i in hits})[:3]}
-
-    return {'found': False, 'rows': None, 'n_cand': 0,
-            'method': 'no_match', 'review': False, 'extra': None}
-
-
-
-
-
-import re, pandas as pd
-
-STOP = {'mr','mrs','ms','dr','md','jr','sr','ii','iii','the'}
-
-def owner_toks(s):
-    if pd.isna(s): return []
-    return [t for t in re.sub(r'[^a-z]', ' ', str(s).lower()).split()
-            if len(t) > 1 and t not in STOP]
-
-def squash(s):
-    return '' if pd.isna(s) else re.sub(r'[^a-z]', '', str(s).lower())
-
-def check(owner, name):
-    toks = owner_toks(owner)
-    c = squash(name)
-    if not toks or not c:
-        return False, 'empty'
-    first = toks[0]
-    if not c.startswith(first):
-        return False, 'first_mismatch'
+def match_toks(toks, c):
+    """tumhare check() ka core — sirf boolean, ordered subsequence containment"""
     pos = 0
     for t in toks:
         j = c.find(t, pos)
         if j == -1:
-            return False, 'no_match'
+            return False
         pos = j + len(t)
-    if c == ''.join(toks):
-        return True, 'exact'
-    return True, ('trailing_extra' if pos == len(c) else 'inner_extra')
+    return True
 
-df = pd.read_csv('name.csv')
-df['my_found'], df['my_method'] = zip(*df.apply(
-    lambda r: check(r['ownername'], r['name']), axis=1))
 
-print(df[['ownername','name','Match','my_found','my_method']].to_string())
+def find_rows(owner):
+    """owner ke liye saare matching source index labels"""
+    toks = owner_toks(owner)
+    if not toks:
+        return []
+    key  = max(toks, key=len)                      # sabse selective token se prefilter
+    cand = src_sq[src_sq.str.contains(key, regex=False)]
+    return [i for i, c in cand.items() if match_toks(toks, c)]
+
+
+# sanity check — ek known naam pe manually verify karo
+test_owner = df[OWNER_COL].iloc[0]
+r = find_rows(test_owner)
+print('owner :', test_owner)
+print('toks  :', owner_toks(test_owner))
+print('hits  :', len(r))
+source.loc[r[:10], [FULL_COL]] if r else print('no match')
+
+
+# ============================================================
+# CELL 4 — SAMPLE RUN (25 rows) + timing extrapolation
+# ============================================================
+N = 25
+sample = df.head(N).copy()
+
+t0 = time.time()
+sample['rows'] = [find_rows(o) for o in tqdm(sample[OWNER_COL], desc='sample')]
+elapsed = time.time() - t0
+
+sample['n_rows'] = sample['rows'].str.len()
+
+print(f'\n{N} rows -> {elapsed:.1f}s  ({elapsed/N:.2f}s per row)')
+print(f'full {len(df)} rows ka estimate: {elapsed/N*len(df)/60:.1f} min\n')
+
+print(sample['n_rows'].describe())
+print('\nzero matches :', (sample['n_rows'] == 0).sum())
+print('50+ matches  :', (sample['n_rows'] >= 50).sum())
+
+sample[[OWNER_COL, 'n_rows']].head(25)
+
+
+# ============================================================
+# CELL 5 — spot check: 3 random samples manually verify karo
+# ============================================================
+for _, r in sample[sample['n_rows'] > 0].sample(min(3, (sample['n_rows']>0).sum()), random_state=1).iterrows():
+    print('=' * 70)
+    print('OWNER:', r[OWNER_COL], '| toks:', owner_toks(r[OWNER_COL]), '| hits:', r['n_rows'])
+    print(source.loc[r['rows'][:5], FULL_COL].to_string())
+
+
+# ============================================================
+# CELL 6 — FULL RUN
+# ============================================================
+t0 = time.time()
+df['rows'] = [find_rows(o) for o in tqdm(df[OWNER_COL], desc='full name match')]
+print(f'\ndone in {(time.time()-t0)/60:.1f} min')
+
+df['n_rows'] = df['rows'].str.len()
+
+print('\n--- summary ---')
+print(f'total df rows      : {len(df)}')
+print(f'with >=1 match     : {(df["n_rows"] > 0).sum()}')
+print(f'with 0 matches     : {(df["n_rows"] == 0).sum()}')
+print(f'total candidate rows: {df["n_rows"].sum():,}')
+print(df['n_rows'].describe())
+
+
+
+# ============================================================
+# CELL 7 — save (pickle, kyunki list column CSV me string ban jaata hai)
+# ============================================================
+df.to_pickle('df_rows.pkl')
+print('saved -> df_rows.pkl')
+
+# audit ke liye readable copy chahiye to alag se:
+df.drop(columns=['rows']).to_csv('df_rows_summary.csv', index=False)
+
+# baad me load:
+# df = pd.read_pickle('df_rows.pkl')
+
+
+# ============================================================
+# CELL 8 — zero-match rows inspect karo (yahi debug ka asli kaam hai)
+# ============================================================
+zero = df[df['n_rows'] == 0]
+print(f'{len(zero)} owners ka koi match nahi\n')
+
+for o in zero[OWNER_COL].head(15):
+    print(f'{o!r:45} -> toks: {owner_toks(o)}')
+
+
+
+def filter_date(r):
+    if not r['rows']:
+        return []
+    sub  = source.loc[r['rows']]
+    keep = (sub['date'] >= r['from_date']) & (sub['date'] <= r['to_date'])
+    return sub.index[keep].tolist()
+
+df['rows_date'] = df.progress_apply(filter_date, axis=1)
+df['n_rows_date'] = df['rows_date'].str.len()
