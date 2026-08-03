@@ -1,0 +1,487 @@
+"""
+Hotel vendor matching on rows_overlap  (car-rental pipeline ka hotel version)
+
+Flow:
+  CELL 1  config + bedrock client + call counter
+  CELL 2  normalization + brand table
+  CELL 3  brute force layer  -> "yes" / "no" / "unsure"
+  CELL 4  LLM layer (only for "unsure")
+  CELL 5  DRY RUN  -> exact LLM call count BEFORE spending anything
+  CELL 6  resolve unique pairs (tqdm + live counter)
+  CELL 7  apply back to r1 -> rows_vendor
+"""
+
+# ============================================================
+# CELL 1 : CONFIG + CLIENT + COUNTER
+# ============================================================
+import os, json, re, time
+import boto3
+import pandas as pd
+from collections import Counter
+
+os.environ["AWS_ACCESS_KEY_ID"]     = "PASTE_ACCESS_KEY"
+os.environ["AWS_SECRET_ACCESS_KEY"] = "PASTE_SECRET_KEY"
+os.environ["AWS_SESSION_TOKEN"]     = "PASTE_SESSION_TOKEN"
+
+AWS_REGION = "us-east-1"
+MODEL_ID   = "us.anthropic.claude-sonnet-4-20250514-v1:0"
+
+# ---- column names: apne hisaab se change kar ----
+TXN_VENDOR_COL   = "vendordescription"       # r1 : transaction ka hotel name
+CAND_VENDOR_COL  = "source_supplier_name"    # df2 : hotel/supplier name
+OVERLAP_ROWS_COL = "rows_overlap"            # r1 : df2 indices ka set/list
+OVERLAP_N_COL    = "n_rows_overlap"          # r1 : len(rows_overlap)
+
+bedrock = boto3.Session(region_name=AWS_REGION).client("bedrock-runtime")
+
+
+class LLMCounter:
+    """Har LLM call yahin se guzarta hai. Kuch bhi count se bahar nahi."""
+    def __init__(self):
+        self.calls = 0          # actual Bedrock invocations
+        self.cache_hits = 0     # pairs answered from cache (0 cost)
+        self.in_tokens = 0
+        self.out_tokens = 0
+        self.errors = 0
+        self.t0 = None
+
+    def start(self):
+        self.t0 = time.time()
+
+    def report(self, prefix=""):
+        el = time.time() - self.t0 if self.t0 else 0
+        print(f"{prefix}LLM calls made      : {self.calls}")
+        print(f"{prefix}Cache hits (free)   : {self.cache_hits}")
+        print(f"{prefix}Input tokens        : {self.in_tokens:,}")
+        print(f"{prefix}Output tokens       : {self.out_tokens:,}")
+        print(f"{prefix}Errors              : {self.errors}")
+        if el:
+            print(f"{prefix}Elapsed             : {el/60:.1f} min")
+
+
+LLM = LLMCounter()
+LLM_CACHE = {}   # {(norm_a, norm_b) sorted tuple : bool}
+
+
+def quick_test():
+    body = {"anthropic_version": "bedrock-2023-05-31", "max_tokens": 10,
+            "temperature": 0,
+            "messages": [{"role": "user", "content": "Reply with exactly one word: OK"}]}
+    resp = bedrock.invoke_model(modelId=MODEL_ID, body=json.dumps(body))
+    print("LLM test:", json.loads(resp["body"].read())["content"][0]["text"])
+    print("(note: ye test call counter me nahi gina gaya)")
+
+# quick_test()
+
+
+# ============================================================
+# CELL 2 : NORMALIZATION + BRAND TABLE
+# ============================================================
+_NOISE = re.compile(
+    r"\b(hotel|hotels|motel|inn|inns|resort|resorts|suites|suite|lodge|lodging|"
+    r"house|guest ?house|hostel|spa|and|the|of|by|at|a|an|"
+    r"llc|inc|ltd|pvt|private|limited|corp|corporation|company|co|holdings|group|"
+    r"international|intl|hospitality|properties|property|management|mgmt)\b"
+)
+_PAY = re.compile(r"\b(sp|sq|tst|pos|pmt|payment|purchase|debit|credit|card|www|com|http[s]?)\b")
+
+def _norm(s):
+    if not isinstance(s, str):
+        return ""
+    s = s.lower().replace("*", " ").replace("-", " ").replace("/", " ")
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = _PAY.sub(" ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _strip_noise(s):
+    s = _NOISE.sub(" ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+# IMPORTANT: sub-brands parent ke UPAR rakhe hain, kyunki
+# "Courtyard by Marriott" ek alag property hai vs "Marriott Marquis".
+# First match wins.
+_BRAND_PATTERNS = [
+    # --- Marriott family ---
+    ("courtyard",        ["courtyard"]),
+    ("residence inn",    ["residence inn", "residenceinn"]),
+    ("fairfield",        ["fairfield"]),
+    ("springhill",       ["springhill"]),
+    ("towneplace",       ["towneplace", "towne place"]),
+    ("four points",      ["four points", "fourpoints"]),
+    ("aloft",            ["aloft"]),
+    ("moxy",             ["moxy"]),
+    ("ac hotel",         ["ac hotel"]),
+    ("element",          ["element hotel", "element by"]),
+    ("westin",           ["westin"]),
+    ("sheraton",         ["sheraton"]),
+    ("renaissance",      ["renaissance"]),
+    ("le meridien",      ["le meridien", "lemeridien"]),
+    ("st regis",         ["st regis", "stregis", "saint regis"]),
+    ("ritz carlton",     ["ritz carlton", "ritzcarlton", "ritz"]),
+    ("w hotel",          ["w hotel", "w hotels"]),
+    ("gaylord",          ["gaylord"]),
+    ("marriott",         ["marriott"]),
+    # --- Hilton family ---
+    ("hampton",          ["hampton"]),
+    ("doubletree",       ["doubletree", "double tree"]),
+    ("embassy suites",   ["embassy"]),
+    ("homewood",         ["homewood"]),
+    ("home2",            ["home2", "home 2"]),
+    ("garden inn",       ["garden inn", "hilton garden"]),
+    ("tru",              ["tru by hilton"]),
+    ("canopy",           ["canopy"]),
+    ("conrad",           ["conrad"]),
+    ("waldorf",          ["waldorf"]),
+    ("curio",            ["curio"]),
+    ("tapestry",         ["tapestry"]),
+    ("hilton",           ["hilton"]),
+    # --- Hyatt family ---
+    ("hyatt place",      ["hyatt place", "hyattplace"]),
+    ("hyatt house",      ["hyatt house"]),
+    ("hyatt regency",    ["hyatt regency"]),
+    ("grand hyatt",      ["grand hyatt"]),
+    ("park hyatt",       ["park hyatt"]),
+    ("andaz",            ["andaz"]),
+    ("thompson",         ["thompson hotel"]),
+    ("alila",            ["alila"]),
+    ("hyatt",            ["hyatt"]),
+    # --- IHG ---
+    ("holiday inn express", ["holiday inn express", "hiexpress", "hi express"]),
+    ("holiday inn",      ["holiday inn", "holidayinn"]),
+    ("crowne plaza",     ["crowne"]),
+    ("staybridge",       ["staybridge"]),
+    ("candlewood",       ["candlewood"]),
+    ("even hotels",      ["even hotel"]),
+    ("hotel indigo",     ["indigo"]),
+    ("kimpton",          ["kimpton"]),
+    ("intercontinental", ["intercontinental", "inter continental"]),
+    ("avid",             ["avid hotel"]),
+    # --- Wyndham / Choice / BW / budget ---
+    ("best western",     ["best western", "bestwestern", "bw premier"]),
+    ("comfort inn",      ["comfort inn", "comfort suites"]),
+    ("quality inn",      ["quality inn", "quality suites"]),
+    ("sleep inn",        ["sleep inn"]),
+    ("clarion",          ["clarion"]),
+    ("econo lodge",      ["econo"]),
+    ("cambria",          ["cambria"]),
+    ("days inn",         ["days inn", "daysinn"]),
+    ("super 8",          ["super 8", "super8"]),
+    ("la quinta",        ["la quinta", "laquinta", "lq "]),
+    ("baymont",          ["baymont"]),
+    ("microtel",         ["microtel"]),
+    ("travelodge",       ["travelodge"]),
+    ("howard johnson",   ["howard johnson", "hojo"]),
+    ("ramada",           ["ramada"]),
+    ("wingate",          ["wingate"]),
+    ("wyndham",          ["wyndham"]),
+    ("red roof",         ["red roof", "redroof"]),
+    ("motel 6",          ["motel 6", "motel6"]),
+    ("extended stay",    ["extended stay", "extendedstay"]),
+    ("americinn",        ["americinn"]),
+    ("drury",            ["drury"]),
+    ("omni",             ["omni hotel", "omni "]),
+    ("loews",            ["loews"]),
+    ("westgate",         ["westgate"]),
+    ("kimpton",          ["kimpton"]),
+    # --- Radisson / Accor / global ---
+    ("radisson blu",     ["radisson blu"]),
+    ("radisson",         ["radisson"]),
+    ("park plaza",       ["park plaza"]),
+    ("park inn",         ["park inn"]),
+    ("country inn",      ["country inn"]),
+    ("novotel",          ["novotel"]),
+    ("ibis",             ["ibis"]),
+    ("mercure",          ["mercure"]),
+    ("pullman",          ["pullman"]),
+    ("sofitel",          ["sofitel"]),
+    ("swissotel",        ["swissotel", "swiss otel"]),
+    ("movenpick",        ["movenpick", "moven pick"]),
+    ("raffles",          ["raffles"]),
+    ("fairmont",         ["fairmont"]),
+    ("banyan tree",      ["banyan"]),
+    ("shangri la",       ["shangri"]),
+    ("mandarin oriental",["mandarin oriental"]),
+    ("four seasons",     ["four seasons", "fourseasons"]),
+    ("peninsula",        ["peninsula hotel"]),
+    ("langham",          ["langham"]),
+    ("rosewood",         ["rosewood"]),
+    ("aman",             ["aman resort", "amanjena", "amanpuri"]),
+    # --- India / APAC ---
+    ("taj",              ["taj hotel", "taj palace", "taj ", "vivanta"]),
+    ("oberoi",           ["oberoi", "trident hotel"]),
+    ("itc",              ["itc hotel", "itc maurya", "itc grand", "welcomhotel"]),
+    ("leela",            ["leela"]),
+    ("lemon tree",       ["lemon tree", "lemontree"]),
+    ("ginger",           ["ginger hotel"]),
+    ("sarovar",          ["sarovar"]),
+    ("treebo",           ["treebo"]),
+    ("fabhotel",         ["fabhotel", "fab hotel"]),
+    ("oyo",              ["oyo"]),
+    ("jw marriott",      ["jw marriott", "jw "]),
+    # --- OTA / aggregator (special: property nahi hai) ---
+    ("booking",          ["booking com", "bookingcom"]),
+    ("expedia",          ["expedia"]),
+    ("hotels com",       ["hotels com"]),
+    ("agoda",            ["agoda"]),
+    ("airbnb",           ["airbnb"]),
+    ("makemytrip",       ["makemytrip", "make my trip"]),
+    ("goibibo",          ["goibibo"]),
+    ("priceline",        ["priceline"]),
+    ("orbitz",           ["orbitz"]),
+    ("travelocity",      ["travelocity"]),
+]
+
+def _brand(nrm):
+    """normalized string se canonical brand nikalta hai, warna ''."""
+    if not nrm:
+        return ""
+    padded = f" {nrm} "
+    for canon, pats in _BRAND_PATTERNS:
+        for p in pats:
+            if p in padded:
+                return canon
+    return ""
+
+def _disc(nrm, brand):
+    """brand hatane ke baad bache huye discriminator tokens (city/airport/street)."""
+    s = nrm
+    if brand:
+        for canon, pats in _BRAND_PATTERNS:
+            if canon == brand:
+                for p in pats:
+                    s = s.replace(p, " ")
+                break
+        s = s.replace(brand, " ")
+    s = _strip_noise(s)
+    return {t for t in s.split() if len(t) >= 3 and not t.isdigit()}
+
+# optional: rapidfuzz agar available ho to ek aur "no" gate mil jaata hai
+try:
+    from rapidfuzz import fuzz
+    _HAS_FUZZ = True
+except ImportError:
+    _HAS_FUZZ = False
+    print("rapidfuzz nahi mila - fuzzy 'no' gate off, LLM calls thode zyada honge")
+
+
+# ============================================================
+# CELL 3 : LAYER 1  -  BRUTE FORCE  ("yes" / "no" / "unsure")
+# ============================================================
+FUZZ_NO_CUTOFF  = 45    # isse neeche = definitely different, LLM mat bhej
+FUZZ_YES_CUTOFF = 92    # isse upar  = definitely same
+
+def brute_match(txn_vendor, cand_vendor):
+    a, b = _norm(txn_vendor), _norm(cand_vendor)
+    if not a or not b:
+        return "no"
+    if a == b:
+        return "yes"
+
+    ba, bb = _brand(a), _brand(b)
+
+    # dono ke brand pata hai
+    if ba and bb:
+        if ba != bb:
+            return "no"                       # Hilton vs Hyatt -> LLM ki zarurat nahi
+        da, db = _disc(a, ba), _disc(b, bb)
+        if not da or not db:
+            return "yes"                      # ek side sirf brand hai
+        if da & db:
+            return "yes"                      # same brand + same city/airport token
+        return "unsure"                       # same brand, alag location -> LLM decide kare
+
+    # sirf ek side ka brand pata hai -> dusra side independent/garbled
+    if bool(ba) != bool(bb):
+        known = ba or bb
+        other = b if ba else a
+        if known.split()[0] in other:
+            return "yes"
+        if _HAS_FUZZ and fuzz.token_set_ratio(a, b) < FUZZ_NO_CUTOFF:
+            return "no"
+        return "unsure"
+
+    # dono independent hotels
+    sa = _strip_noise(a)
+    sb = _strip_noise(b)
+    if not sa or not sb:
+        return "unsure"
+    if sa == sb or sa in sb or sb in sa:
+        return "yes"
+    ta = {t for t in sa.split() if len(t) >= 4}
+    tb = {t for t in sb.split() if len(t) >= 4}
+    if ta and tb:
+        ov = len(ta & tb) / min(len(ta), len(tb))
+        if ov >= 0.75:
+            return "yes"
+    if _HAS_FUZZ:
+        sc = fuzz.token_set_ratio(sa, sb)
+        if sc >= FUZZ_YES_CUTOFF:
+            return "yes"
+        if sc < FUZZ_NO_CUTOFF:
+            return "no"
+    return "unsure"
+
+
+# ============================================================
+# CELL 4 : LAYER 2  -  LLM (counted)
+# ============================================================
+_PROMPT = """You are matching hotel names from a credit card transaction against a hotel name from an invoice system.
+
+The same property can look different: abbreviations, missing sub-brand, airport or city codes appended, payment-processor prefixes, franchisee legal names.
+
+Rules:
+- Same brand AND same property/location = SAME
+- Same brand but clearly DIFFERENT city or property = DIFFERENT
+- Different sub-brands of the same parent (e.g. "Courtyard by Marriott" vs "JW Marriott") = DIFFERENT
+- An online travel agency (Expedia, Booking.com) is NEVER the same as a hotel property
+
+Transaction hotel: "{txn}"
+Candidate hotel:   "{cand}"
+
+Do these refer to the same hotel property? Answer with exactly one word: YES or NO."""
+
+def _cache_key(a, b):
+    na, nb = _norm(a), _norm(b)
+    return (na, nb) if na <= nb else (nb, na)
+
+def llm_match(txn_vendor, cand_vendor, retries=3):
+    key = _cache_key(txn_vendor, cand_vendor)
+    if key in LLM_CACHE:
+        LLM.cache_hits += 1
+        return LLM_CACHE[key]
+
+    body = {"anthropic_version": "bedrock-2023-05-31", "max_tokens": 5,
+            "temperature": 0,
+            "messages": [{"role": "user",
+                          "content": _PROMPT.format(txn=txn_vendor, cand=cand_vendor)}]}
+
+    for attempt in range(retries):
+        try:
+            resp = bedrock.invoke_model(modelId=MODEL_ID, body=json.dumps(body))
+            LLM.calls += 1                       # <-- yahan ginti hoti hai
+            out = json.loads(resp["body"].read())
+            u = out.get("usage", {})
+            LLM.in_tokens  += u.get("input_tokens", 0)
+            LLM.out_tokens += u.get("output_tokens", 0)
+            ans = out["content"][0]["text"].strip().lower().startswith("yes")
+            LLM_CACHE[key] = ans
+            return ans
+        except Exception as e:
+            if attempt == retries - 1:
+                LLM.errors += 1
+                LLM_CACHE[key] = False           # fail-safe: no match
+                print("LLM fail:", repr(txn_vendor), "|", repr(cand_vendor), "|", e)
+                return False
+            time.sleep(2 ** attempt)
+
+
+# ============================================================
+# CELL 5 : DRY RUN  -  kitne LLM calls lagenge, PEHLE pata karo
+# ============================================================
+def _as_rows(v):
+    """set / list / str-from-csv sab handle kar leta hai."""
+    if isinstance(v, (set, list, tuple)):
+        return list(v)
+    if isinstance(v, str) and v.strip():
+        return [int(x) for x in re.findall(r"\d+", v)]
+    return []
+
+cand_vendor_arr = df2[CAND_VENDOR_COL].to_numpy()
+
+def build_workload(r1):
+    """Har (txn, cand) pair pe brute force chalao, unsure pairs collect karo."""
+    stats = Counter()
+    unsure_pairs = set()      # unique normalized pairs -> yahi LLM calls honge
+    pair_examples = {}
+
+    for txn, rows, n in zip(r1[TXN_VENDOR_COL], r1[OVERLAP_ROWS_COL], r1[OVERLAP_N_COL]):
+        if not n or n <= 0:
+            stats["skipped_no_overlap"] += 1
+            continue
+        for r in _as_rows(rows):
+            cand = cand_vendor_arr[r]
+            v = brute_match(txn, cand)
+            stats[f"brute_{v}"] += 1
+            stats["total_comparisons"] += 1
+            if v == "unsure":
+                k = _cache_key(txn, cand)
+                if k not in LLM_CACHE:
+                    unsure_pairs.add(k)
+                    pair_examples.setdefault(k, (txn, cand))
+    return stats, unsure_pairs, pair_examples
+
+
+stats, unsure_pairs, pair_examples = build_workload(r1)
+
+print("=" * 58)
+print("DRY RUN  (abhi tak 0 LLM calls hue hain)")
+print("=" * 58)
+print(f"Rows skipped (n_rows_overlap<=0) : {stats['skipped_no_overlap']:,}")
+print(f"Total pair comparisons           : {stats['total_comparisons']:,}")
+print(f"  brute YES    (no LLM)          : {stats['brute_yes']:,}")
+print(f"  brute NO     (no LLM)          : {stats['brute_no']:,}")
+print(f"  brute UNSURE                   : {stats['brute_unsure']:,}")
+print("-" * 58)
+print(f">>> UNIQUE pairs needing LLM     : {len(unsure_pairs):,}")
+if stats['total_comparisons']:
+    saved = 100 * (1 - len(unsure_pairs) / stats['total_comparisons'])
+    print(f">>> Calls saved by dedupe+brute   : {saved:.1f}%")
+print(f">>> Est. cost @ ~120 in / 3 out tok: "
+      f"${len(unsure_pairs)*(120*3e-6 + 3*15e-6):.2f}  (sonnet-4 pricing)")
+print("=" * 58)
+
+print("\n10 sample pairs jo LLM ko jaayenge:")
+for k in list(unsure_pairs)[:10]:
+    t, c = pair_examples[k]
+    print(f"   {t!r:45} <-> {c!r}")
+
+# >>> Yahin ruk ja. Number theek lage tabhi CELL 6 chala. <<<
+
+
+# ============================================================
+# CELL 6 : RESOLVE UNIQUE PAIRS  (asli LLM calls yahan)
+# ============================================================
+from tqdm.auto import tqdm
+
+LLM.start()
+for k in tqdm(sorted(unsure_pairs), desc="LLM vendor match"):
+    txn, cand = pair_examples[k]
+    llm_match(txn, cand)
+
+print("\n---- LLM USAGE ----")
+LLM.report()
+
+yes_n = sum(1 for k in unsure_pairs if LLM_CACHE.get(k))
+print(f"LLM said YES: {yes_n:,} / {len(unsure_pairs):,}")
+
+
+# ============================================================
+# CELL 7 : APPLY BACK TO r1
+# ============================================================
+def vendor_match(txn_vendor, cand_vendor):
+    v = brute_match(txn_vendor, cand_vendor)
+    if v == "yes":
+        return True
+    if v == "no":
+        return False
+    return llm_match(txn_vendor, cand_vendor)     # cache se aayega, naya call nahi
+
+def vendor_filter(txn_vendor, rows, n):
+    if not n or n <= 0 or not isinstance(txn_vendor, str):
+        return set()
+    return {r for r in _as_rows(rows) if vendor_match(txn_vendor, cand_vendor_arr[r])}
+
+calls_before = LLM.calls
+
+r1["rows_vendor"] = [
+    vendor_filter(v, rws, n)
+    for v, rws, n in zip(r1[TXN_VENDOR_COL], r1[OVERLAP_ROWS_COL], r1[OVERLAP_N_COL])
+]
+r1["n_rows_vendor"] = r1["rows_vendor"].map(len)
+r1["vendor_found"]  = r1["n_rows_vendor"] > 0
+
+print(f"\nApply step me extra LLM calls: {LLM.calls - calls_before}  (0 hona chahiye)")
+print(r1["vendor_found"].value_counts())
+print("\n---- FINAL LLM TOTAL ----")
+LLM.report()
