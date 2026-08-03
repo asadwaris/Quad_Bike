@@ -1,0 +1,57 @@
+# ============================================================
+# CELL 11 — overlap filter: sirf n_rows>0 & n_rows_date==0 wali rows pe
+# ============================================================
+
+def one_day_overlaps(a_lo, a_hi, b_lo, b_hi):
+    # do inclusive intervals overlap?
+    return a_lo <= b_hi and b_lo <= a_hi
+
+def in_range(d, lo, hi):
+    return lo <= d <= hi
+
+def filter_overlap(r):
+    # sirf naam-mila-par-exact-date-fail wali rows
+    if not (r['n_rows'] > 0 and r['n_rows_date'] == 0):
+        return []
+
+    d_inv, d_in, d_out = r[DF_INV], r[DF_IN], r[DF_OUT]
+    sub = source.loc[r['rows']]
+
+    out = []
+    for i, s in sub.iterrows():
+        s_inv, s_in, s_out = s[SRC_INV], s[SRC_IN], s[SRC_OUT]
+
+        # df ka range [d_in..d_out]  vs  source ka range [s_in..s_out]
+        hit = one_day_overlaps(d_in, d_out, s_in, s_out)
+
+        # df ka koi din source-inv pe (df range me inv aata hai ya df_inv khud)
+        hit = hit or in_range(s_inv, d_in, d_out) or (d_inv == s_inv)
+
+        # source ka koi din df-inv pe (df_inv source range me)
+        hit = hit or in_range(d_inv, s_in, s_out)
+
+# ============================================================
+# CELL 12 — spot check + save
+# ============================================================
+chk = df[df['n_rows_overlap'] > 0].head(3)
+for _, r in chk.iterrows():
+    print('=' * 70)
+    print(f'OWNER: {r[OWNER_COL]} | df inv:{r[DF_INV].date()} in:{r[DF_IN].date()} out:{r[DF_OUT].date()}')
+    print(source.loc[r['rows_overlap'], [FULL_COL, SRC_INV, SRC_IN, SRC_OUT]].to_string())
+
+df.to_pickle('df_rows_overlap.pkl')
+print('\nsaved -> df_rows_overlap.pkl')
+
+        if hit:
+            out.append(i)
+    return out
+
+df['rows_overlap']   = df.progress_apply(filter_overlap, axis=1)
+df['n_rows_overlap'] = df['rows_overlap'].str.len()
+
+print('--- overlap filter summary ---')
+elig = (df['n_rows'] > 0) & (df['n_rows_date'] == 0)
+print(f'eligible rows (name-ok, exact-date-fail): {elig.sum()}')
+print(f'recovered by overlap (>0)               : {(df["n_rows_overlap"] > 0).sum()}')
+print(f'total candidate rows after overlap      : {df["n_rows_overlap"].sum():,}')
+print(df.loc[elig, 'n_rows_overlap'].describe())
