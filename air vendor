@@ -1,0 +1,567 @@
+"""
+Airline vendor matching on rows_overlap   (hotel pipeline ka airline version)
+
+Hotel se 2 bade differences:
+  1. Airline = ek single entity. "AMERICAN AIRLINES JFK" aur "American Airlines"
+     SAME hain. Hotel wala location-discriminator logic yahan NAHI chahiye.
+     Isi wajah se LLM calls bahut kam honge.
+  2. Card descriptor me aksar IATA ticket prefix hota hai:
+     "AMERICAN AIR0012345678901" -> 001 = American. Ye deterministic signal hai,
+     name dekhne ki zarurat hi nahi padti.
+
+Flow:
+  CELL 1  config + client + counter
+  CELL 2  normalization + carrier table (names + IATA prefix + 2-letter code)
+  CELL 3  brute force  -> "yes" / "no" / "unsure"
+  CELL 4  LLM layer (counted)
+  CELL 5  DRY RUN -> exact LLM call count
+  CELL 6  resolve unique pairs
+  CELL 7  apply back to r1
+"""
+
+# ============================================================
+# CELL 1 : CONFIG + CLIENT + COUNTER
+# ============================================================
+import os, json, re, time
+import boto3
+import pandas as pd
+from collections import Counter
+
+os.environ["AWS_ACCESS_KEY_ID"]     = "PASTE_ACCESS_KEY"
+os.environ["AWS_SECRET_ACCESS_KEY"] = "PASTE_SECRET_KEY"
+os.environ["AWS_SESSION_TOKEN"]     = "PASTE_SESSION_TOKEN"
+
+AWS_REGION = "us-east-1"
+MODEL_ID   = "us.anthropic.claude-sonnet-4-20250514-v1:0"
+
+# ---- column names: apne hisaab se change kar ----
+TXN_VENDOR_COL   = "vendordescription"       # r1 : transaction ka airline name
+CAND_VENDOR_COL  = "source_supplier_name"    # df2 : airline/supplier name
+OVERLAP_ROWS_COL = "rows_overlap"            # r1 : df2 indices ka set/list
+OVERLAP_N_COL    = "n_rows_overlap"          # r1 : len(rows_overlap)
+
+# Regional affiliate ko parent maanein?
+#   True  -> "American Eagle" == "American Airlines"  (ticket AA stock pe issue hota hai)
+#   False -> alag carriers
+REGIONAL_AS_PARENT = True
+
+bedrock = boto3.Session(region_name=AWS_REGION).client("bedrock-runtime")
+
+
+class LLMCounter:
+    def __init__(self):
+        self.calls = 0
+        self.cache_hits = 0
+        self.in_tokens = 0
+        self.out_tokens = 0
+        self.errors = 0
+        self.t0 = None
+
+    def start(self):
+        self.t0 = time.time()
+
+    def report(self, prefix=""):
+        el = time.time() - self.t0 if self.t0 else 0
+        print(f"{prefix}LLM calls made      : {self.calls}")
+        print(f"{prefix}Cache hits (free)   : {self.cache_hits}")
+        print(f"{prefix}Input tokens        : {self.in_tokens:,}")
+        print(f"{prefix}Output tokens       : {self.out_tokens:,}")
+        print(f"{prefix}Errors              : {self.errors}")
+        if el:
+            print(f"{prefix}Elapsed             : {el/60:.1f} min")
+
+
+LLM = LLMCounter()
+LLM_CACHE = {}
+
+
+def quick_test():
+    body = {"anthropic_version": "bedrock-2023-05-31", "max_tokens": 10,
+            "temperature": 0,
+            "messages": [{"role": "user", "content": "Reply with exactly one word: OK"}]}
+    resp = bedrock.invoke_model(modelId=MODEL_ID, body=json.dumps(body))
+    print("LLM test:", json.loads(resp["body"].read())["content"][0]["text"])
+    print("(ye test call counter me nahi gina gaya)")
+
+# quick_test()
+
+
+# ============================================================
+# CELL 2 : NORMALIZATION + CARRIER TABLE
+# ============================================================
+_NOISE = re.compile(
+    r"\b(airlines?|airline|airways?|airway|air ?lines?|aviation|"
+    r"flight|flights|fly|jet|jets|group|holdings|"
+    r"inc|llc|ltd|pvt|private|limited|corp|corporation|company|co|"
+    r"international|intl|the|of|and)\b"
+)
+_PAY = re.compile(r"\b(sp|sq|tst|pos|pmt|payment|purchase|debit|credit|card|"
+                  r"www|com|http[s]?|inflight|inflt|wifi|baggage|bag ?fee|"
+                  r"seat|upgrade|ancillary|kiosk|onboard)\b")
+
+# IATA ticket number: 3-digit airline prefix + 10-digit serial
+_TICKET = re.compile(r"\b(\d{3})[\s\-]?\d{10}\b")
+# kabhi kabhi sirf prefix chipka hota hai naam ke saath: "AMERICAN AIR001..."
+_PREFIX_GLUED = re.compile(r"(?<![\d])(\d{3})(?=\d{6,})")
+
+
+def _norm(s):
+    if not isinstance(s, str):
+        return ""
+    s = s.lower().replace("*", " ").replace("-", " ").replace("/", " ")
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = _PAY.sub(" ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _strip_noise(s):
+    s = _NOISE.sub(" ", s)
+    s = re.sub(r"\d+", " ", s)          # airline me digits sirf ticket no. hote hain
+    return re.sub(r"\s+", " ", s).strip()
+
+
+# (canonical, [name patterns], [IATA numeric prefixes], [2-letter codes])
+_CARRIERS = [
+    # ---- US majors ----
+    ("american",      ["american eagle", "american", "americanair", "aa "], ["001"], ["aa"]),
+    ("delta",         ["delta connection", "delta", "deltaair"],            ["006"], ["dl"]),
+    ("united",        ["united express", "united"],                        ["016", "005"], ["ua"]),
+    ("southwest",     ["southwest", "southwes", "swa"],                    ["526"], ["wn"]),
+    ("alaska",        ["alaska", "horizon air"],                           ["027"], ["as"]),
+    ("jetblue",       ["jetblue", "jet blue"],                             ["279"], ["b6"]),
+    ("spirit",        ["spirit"],                                          ["487"], ["nk"]),
+    ("frontier",      ["frontier"],                                        ["422"], ["f9"]),
+    ("hawaiian",      ["hawaiian"],                                        ["173"], ["ha"]),
+    ("allegiant",     ["allegiant"],                                       ["717"], ["g4"]),
+    ("sun country",   ["sun country", "suncountry"],                       ["337"], ["sy"]),
+    ("breeze",        ["breeze"],                                          [],      ["mx"]),
+    ("avelo",         ["avelo"],                                           [],      ["xp"]),
+    # legacy / merged (alag rakhe, kyunki purane data me aa sakte hain)
+    ("us airways",    ["us airways", "usairways", "us air"],               ["037"], ["us"]),
+    ("continental",   ["continental"],                                     ["005"], ["co"]),
+    ("northwest",     ["northwest air", "nwa"],                            ["012"], ["nw"]),
+    ("virgin america",["virgin america"],                                  ["984"], ["vx"]),
+    # ---- Canada / LatAm ----
+    ("air canada",    ["air canada", "aircanada"],                         ["014"], ["ac"]),
+    ("westjet",       ["westjet", "west jet"],                             ["838"], ["ws"]),
+    ("porter",        ["porter"],                                          [],      ["pd"]),
+    ("aeromexico",    ["aeromexico", "aero mexico"],                       ["139"], ["am"]),
+    ("volaris",       ["volaris"],                                         ["204"], ["y4"]),
+    ("copa",          ["copa"],                                            ["230"], ["cm"]),
+    ("latam",         ["latam", "lan airlines", "tam "],                   ["045"], ["la"]),
+    ("avianca",       ["avianca"],                                         ["134"], ["av"]),
+    ("gol",           ["gol linhas", "gol "],                              ["127"], ["g3"]),
+    ("azul",          ["azul"],                                            ["577"], ["ad"]),
+    # ---- Europe ----
+    ("british airways",["british airways", "britishairways", "brit airways"], ["125"], ["ba"]),
+    ("lufthansa",     ["lufthansa"],                                       ["220"], ["lh"]),
+    ("air france",    ["air france", "airfrance"],                         ["057"], ["af"]),
+    ("klm",           ["klm", "royal dutch"],                              ["074"], ["kl"]),
+    ("iberia",        ["iberia"],                                          ["075"], ["ib"]),
+    ("swiss",         ["swiss air", "swiss intl", "swiss "],               ["724"], ["lx"]),
+    ("austrian",      ["austrian"],                                        ["257"], ["os"]),
+    ("brussels",      ["brussels air"],                                    ["082"], ["sn"]),
+    ("sas",           ["scandinavian", "sas "],                            ["117"], ["sk"]),
+    ("finnair",       ["finnair"],                                         ["105"], ["ay"]),
+    ("tap",           ["tap portugal", "tap air"],                         ["047"], ["tp"]),
+    ("aer lingus",    ["aer lingus", "aerlingus"],                         ["053"], ["ei"]),
+    ("ryanair",       ["ryanair", "ryan air"],                             [],      ["fr"]),
+    ("easyjet",       ["easyjet", "easy jet"],                             [],      ["u2"]),
+    ("wizz",          ["wizz"],                                            [],      ["w6"]),
+    ("norwegian",     ["norwegian"],                                       ["328"], ["dy"]),
+    ("vueling",       ["vueling"],                                         ["546"], ["vy"]),
+    ("turkish",       ["turkish"],                                         ["235"], ["tk"]),
+    ("aeroflot",      ["aeroflot"],                                        ["555"], ["su"]),
+    ("lot",           ["lot polish", "lot "],                              ["080"], ["lo"]),
+    ("virgin atlantic",["virgin atlantic"],                                ["932"], ["vs"]),
+    # ---- Middle East / Africa ----
+    ("emirates",      ["emirates"],                                        ["176"], ["ek"]),
+    ("qatar",         ["qatar"],                                           ["157"], ["qr"]),
+    ("etihad",        ["etihad"],                                          ["607"], ["ey"]),
+    ("saudia",        ["saudia", "saudi arabian air"],                     ["065"], ["sv"]),
+    ("flynas",        ["flynas", "fly nas"],                               [],      ["xy"]),
+    ("royal jordanian",["royal jordanian"],                                ["512"], ["rj"]),
+    ("egyptair",      ["egyptair", "egypt air"],                           ["077"], ["ms"]),
+    ("ethiopian",     ["ethiopian"],                                       ["071"], ["et"]),
+    ("kenya airways", ["kenya airways"],                                   ["706"], ["kq"]),
+    ("south african", ["south african air"],                               ["083"], ["sa"]),
+    # ---- Asia / Pacific ----
+    ("air india",     ["air india", "airindia", "vistara"],                ["098"], ["ai"]),
+    ("indigo",        ["indigo", "interglobe"],                            ["312"], ["6e"]),
+    ("spicejet",      ["spicejet", "spice jet"],                           ["775"], ["sg"]),
+    ("akasa",         ["akasa"],                                           [],      ["qp"]),
+    ("jet airways",   ["jet airways"],                                     ["589"], ["9w"]),
+    ("singapore",     ["singapore air", "singaporeair"],                   ["618"], ["sq"]),
+    ("cathay",        ["cathay"],                                          ["160"], ["cx"]),
+    ("japan airlines",["japan airlines", "jal "],                          ["131"], ["jl"]),
+    ("ana",           ["all nippon", "ana "],                              ["205"], ["nh"]),
+    ("korean air",    ["korean air", "koreanair"],                         ["180"], ["ke"]),
+    ("asiana",        ["asiana"],                                          ["988"], ["oz"]),
+    ("thai",          ["thai airways", "thai intl"],                       ["217"], ["tg"]),
+    ("malaysia",      ["malaysia air"],                                    ["232"], ["mh"]),
+    ("garuda",        ["garuda"],                                          ["126"], ["ga"]),
+    ("air china",     ["air china", "airchina"],                           ["999"], ["ca"]),
+    ("china eastern", ["china eastern"],                                   ["781"], ["mu"]),
+    ("china southern",["china southern"],                                  ["784"], ["cz"]),
+    ("qantas",        ["qantas"],                                          ["081"], ["qf"]),
+    ("virgin australia",["virgin australia", "virgin blue"],               ["795"], ["va"]),
+    ("air new zealand",["air new zealand", "air nz"],                      ["086"], ["nz"]),
+    ("philippine",    ["philippine air", "pal "],                          ["079"], ["pr"]),
+    ("vietnam",       ["vietnam air"],                                     ["738"], ["vn"]),
+    ("air asia",      ["airasia", "air asia"],                             [],      ["ak"]),
+    ("scoot",         ["scoot"],                                           [],      ["tr"]),
+]
+
+# non-airline vendors jo airline feed me ghus jaate hain -> kabhi match nahi
+_NON_CARRIER = [
+    "expedia", "orbitz", "travelocity", "priceline", "kayak", "booking",
+    "makemytrip", "goibibo", "cleartrip", "yatra", "cheapoair", "hotwire",
+    "sabre", "amadeus", "travelport", "concur", "egencia", "navan", "tripactions",
+    "airport parking", "parking", "tsa", "clear me", "global entry",
+    "united van lines",           # moving company, "united" se clash karta hai
+    "american express", "amex",   # "american" se clash
+    "delta dental", "delta faucet",
+]
+
+_CANON_INDEX = {c[0]: c for c in _CARRIERS}
+
+# regional affiliate -> parent
+_REGIONAL_PARENT = {
+    "envoy": "american", "piedmont": "american", "psa": "american",
+    "skywest": None, "republic": None, "mesa": None,     # multiple parents, ambiguous
+    "endeavor": "delta", "horizon": "alaska",
+}
+
+
+def _ticket_prefix(raw):
+    """Descriptor me IATA ticket prefix mile to nikaal lo."""
+    if not isinstance(raw, str):
+        return ""
+    digits = re.sub(r"[^\d]", "", raw)
+    m = _TICKET.search(raw) or _TICKET.search(digits)
+    if m:
+        return m.group(1)
+    m = _PREFIX_GLUED.search(digits)
+    if m and len(digits) >= 11:
+        return m.group(1)
+    return ""
+
+
+def _carrier_from_prefix(pfx):
+    if not pfx:
+        return ""
+    for canon, _names, prefixes, _codes in _CARRIERS:
+        if pfx in prefixes:
+            return canon
+    return ""
+
+
+def _is_non_carrier(nrm):
+    padded = f" {nrm} "
+    return any(x in padded for x in _NON_CARRIER)
+
+
+def _carrier(raw):
+    """
+    Returns (canonical_carrier, confidence)
+      confidence: 'ticket' > 'name' > 'code' > ''
+    """
+    nrm = _norm(raw)
+    if not nrm:
+        return "", ""
+
+    # 1) ticket prefix sabse strong signal hai
+    c = _carrier_from_prefix(_ticket_prefix(raw))
+    if c:
+        return c, "ticket"
+
+    # 2) non-carrier check name-match se PEHLE
+    #    ("american express" ko "american" na bana de)
+    if _is_non_carrier(nrm):
+        return "__nonair__", "name"
+
+    # 3) name patterns
+    padded = f" {nrm} "
+    for canon, names, _p, _c in _CARRIERS:
+        for n in names:
+            if n in padded:
+                return canon, "name"
+
+    # 4) regional affiliate
+    for reg, parent in _REGIONAL_PARENT.items():
+        if reg in padded:
+            if parent and REGIONAL_AS_PARENT:
+                return parent, "name"
+            return f"regional:{reg}", "name"
+
+    # 5) standalone 2-letter code (sirf tab jab string chhoti ho)
+    toks = nrm.split()
+    if len(toks) <= 2:
+        for canon, _n, _p, codes in _CARRIERS:
+            if any(t in codes for t in toks):
+                return canon, "code"
+
+    return "", ""
+
+
+try:
+    from rapidfuzz import fuzz
+    _HAS_FUZZ = True
+except ImportError:
+    _HAS_FUZZ = False
+    print("rapidfuzz nahi mila - typo gate off, LLM calls thode zyada")
+
+
+# ============================================================
+# CELL 3 : LAYER 1  -  BRUTE FORCE  ("yes" / "no" / "unsure")
+# ============================================================
+FUZZ_YES_CUTOFF = 85    # "soutwes" vs "southwest" type typo yahan pakda jaayega
+FUZZ_NO_CUTOFF  = 45
+
+def brute_match(txn_vendor, cand_vendor):
+    a, b = _norm(txn_vendor), _norm(cand_vendor)
+    if not a or not b:
+        return "no"
+    if a == b:
+        return "yes"
+
+    ca, conf_a = _carrier(txn_vendor)
+    cb, conf_b = _carrier(cand_vendor)
+
+    # OTA / parking / non-airline vs airline -> kabhi same nahi
+    if (ca == "__nonair__") != (cb == "__nonair__"):
+        return "no"
+    if ca == "__nonair__" and cb == "__nonair__":
+        return "yes" if a == b or a in b or b in a else "unsure"
+
+    # dono carriers identify ho gaye -> yahi 90%+ cases hain
+    if ca and cb:
+        return "yes" if ca == cb else "no"
+
+    # ek side identify hua, dusra garbled/typo
+    if bool(ca) != bool(cb):
+        known = ca or cb
+        other_raw = cand_vendor if ca else txn_vendor
+        other = _strip_noise(_norm(other_raw))
+        if not other:
+            return "unsure"
+        # canonical name ke against typo check: "soutwes" -> "southwest"
+        if _HAS_FUZZ:
+            best = max(
+                fuzz.partial_ratio(known, other),
+                fuzz.token_set_ratio(known, other),
+                max((fuzz.ratio(n, other) for n in _CANON_INDEX.get(known, ("", [], [], []))[1]),
+                    default=0),
+            )
+            if best >= FUZZ_YES_CUTOFF:
+                return "yes"
+            if best < FUZZ_NO_CUTOFF:
+                return "no"
+        else:
+            if known.split()[0][:5] in other or other[:5] in known:
+                return "yes"
+        return "unsure"
+
+    # dono unknown (charter / regional / garbage)
+    sa, sb = _strip_noise(a), _strip_noise(b)
+    if not sa or not sb:
+        return "unsure"
+    if sa == sb or sa in sb or sb in sa:
+        return "yes"
+    if _HAS_FUZZ:
+        sc = fuzz.token_set_ratio(sa, sb)
+        if sc >= 90:
+            return "yes"
+        if sc < FUZZ_NO_CUTOFF:
+            return "no"
+    return "unsure"
+
+
+# ============================================================
+# CELL 4 : LAYER 2  -  LLM (counted)
+# ============================================================
+_PROMPT = """You are matching airline names from a credit card transaction against an airline name from an invoice system.
+
+The same carrier can look different: abbreviations, typos, missing "Airlines"/"Airways", IATA ticket prefixes or two-letter codes attached, payment-processor text.
+
+Rules:
+- An airline is a single company. Airport codes, city names, or route info attached to the name do NOT make it a different vendor. "AMERICAN AIRLINES JFK" and "American Airlines" are the SAME.
+- Typos and truncations are still the same carrier: "SOUTWES" and "Southwest Airlines" are the SAME.
+- Similar-sounding but distinct carriers are DIFFERENT: "Air Canada" vs "Air China", "JetBlue" vs "Jet Airways", "Virgin Atlantic" vs "Virgin Australia".
+- A travel agency, booking site, GDS, or airport service (Expedia, Sabre, parking, TSA) is NEVER the same as an airline.
+
+Transaction vendor: "{txn}"
+Candidate vendor:   "{cand}"
+
+Do these refer to the same airline? Answer with exactly one word: YES or NO."""
+
+
+def _cache_key(a, b):
+    na, nb = _norm(a), _norm(b)
+    return (na, nb) if na <= nb else (nb, na)
+
+
+def llm_match(txn_vendor, cand_vendor, retries=3):
+    key = _cache_key(txn_vendor, cand_vendor)
+    if key in LLM_CACHE:
+        LLM.cache_hits += 1
+        return LLM_CACHE[key]
+
+    body = {"anthropic_version": "bedrock-2023-05-31", "max_tokens": 5,
+            "temperature": 0,
+            "messages": [{"role": "user",
+                          "content": _PROMPT.format(txn=txn_vendor, cand=cand_vendor)}]}
+
+    for attempt in range(retries):
+        try:
+            resp = bedrock.invoke_model(modelId=MODEL_ID, body=json.dumps(body))
+            LLM.calls += 1
+            out = json.loads(resp["body"].read())
+            u = out.get("usage", {})
+            LLM.in_tokens  += u.get("input_tokens", 0)
+            LLM.out_tokens += u.get("output_tokens", 0)
+            ans = out["content"][0]["text"].strip().lower().startswith("yes")
+            LLM_CACHE[key] = ans
+            return ans
+        except Exception as e:
+            if attempt == retries - 1:
+                LLM.errors += 1
+                LLM_CACHE[key] = False
+                print("LLM fail:", repr(txn_vendor), "|", repr(cand_vendor), "|", e)
+                return False
+            time.sleep(2 ** attempt)
+
+
+# ============================================================
+# CELL 5 : DRY RUN
+# ============================================================
+def _as_rows(v):
+    if isinstance(v, (set, list, tuple)):
+        return list(v)
+    if isinstance(v, str) and v.strip():
+        return [int(x) for x in re.findall(r"\d+", v)]
+    return []
+
+
+cand_vendor_arr = df2[CAND_VENDOR_COL].to_numpy()
+
+
+def build_workload(r1):
+    stats = Counter()
+    unsure_pairs = set()
+    pair_examples = {}
+
+    for txn, rows, n in zip(r1[TXN_VENDOR_COL], r1[OVERLAP_ROWS_COL], r1[OVERLAP_N_COL]):
+        if not n or n <= 0:
+            stats["skipped_no_overlap"] += 1
+            continue
+        for r in _as_rows(rows):
+            cand = cand_vendor_arr[r]
+            v = brute_match(txn, cand)
+            stats[f"brute_{v}"] += 1
+            stats["total_comparisons"] += 1
+            if v == "unsure":
+                k = _cache_key(txn, cand)
+                if k not in LLM_CACHE:
+                    unsure_pairs.add(k)
+                    pair_examples.setdefault(k, (txn, cand))
+    return stats, unsure_pairs, pair_examples
+
+
+stats, unsure_pairs, pair_examples = build_workload(r1)
+
+print("=" * 58)
+print("DRY RUN  (abhi tak 0 LLM calls)")
+print("=" * 58)
+print(f"Rows skipped (n_rows_overlap<=0) : {stats['skipped_no_overlap']:,}")
+print(f"Total pair comparisons           : {stats['total_comparisons']:,}")
+print(f"  brute YES    (no LLM)          : {stats['brute_yes']:,}")
+print(f"  brute NO     (no LLM)          : {stats['brute_no']:,}")
+print(f"  brute UNSURE                   : {stats['brute_unsure']:,}")
+print("-" * 58)
+print(f">>> UNIQUE pairs needing LLM     : {len(unsure_pairs):,}")
+if stats['total_comparisons']:
+    saved = 100 * (1 - len(unsure_pairs) / stats['total_comparisons'])
+    print(f">>> Calls saved by brute+dedupe  : {saved:.1f}%")
+print(f">>> Est. cost @ ~150 in / 3 out tok: "
+      f"${len(unsure_pairs)*(150*3e-6 + 3*15e-6):.2f}")
+print("=" * 58)
+
+print("\n10 sample pairs jo LLM ko jaayenge:")
+for k in list(unsure_pairs)[:10]:
+    t, c = pair_examples[k]
+    print(f"   {t!r:45} <-> {c!r}")
+
+# ---- sanity: kaunse carriers detect hue, kitne unknown reh gaye ----
+det = Counter(_carrier(v)[0] or "__UNKNOWN__" for v in r1[TXN_VENDOR_COL].dropna().unique())
+print("\nTop carriers detected in r1 (unique vendor strings):")
+for c, n in det.most_common(20):
+    print(f"   {c:20} {n:,}")
+
+# >>> Number theek lage tabhi CELL 6 chala <<<
+
+
+# ============================================================
+# CELL 6 : RESOLVE UNIQUE PAIRS
+# ============================================================
+from tqdm.auto import tqdm
+
+LLM.start()
+for k in tqdm(sorted(unsure_pairs), desc="LLM airline match"):
+    txn, cand = pair_examples[k]
+    llm_match(txn, cand)
+
+print("\n---- LLM USAGE ----")
+LLM.report()
+yes_n = sum(1 for k in unsure_pairs if LLM_CACHE.get(k))
+print(f"LLM said YES: {yes_n:,} / {len(unsure_pairs):,}")
+
+
+# ============================================================
+# CELL 7 : APPLY BACK TO r1
+# ============================================================
+def vendor_match(txn_vendor, cand_vendor):
+    v = brute_match(txn_vendor, cand_vendor)
+    if v == "yes":
+        return True
+    if v == "no":
+        return False
+    return llm_match(txn_vendor, cand_vendor)
+
+
+def vendor_filter(txn_vendor, rows, n):
+    if not n or n <= 0 or not isinstance(txn_vendor, str):
+        return set()
+    return {r for r in _as_rows(rows) if vendor_match(txn_vendor, cand_vendor_arr[r])}
+
+
+calls_before = LLM.calls
+
+r1["rows_vendor"] = [
+    vendor_filter(v, rws, n)
+    for v, rws, n in zip(r1[TXN_VENDOR_COL], r1[OVERLAP_ROWS_COL], r1[OVERLAP_N_COL])
+]
+r1["n_rows_vendor"] = r1["rows_vendor"].map(len)
+r1["vendor_found"]  = r1["n_rows_vendor"] > 0
+
+print(f"\nApply step me extra LLM calls: {LLM.calls - calls_before}  (0 hona chahiye)")
+print(r1["vendor_found"].value_counts())
+print("\n---- FINAL LLM TOTAL ----")
+LLM.report()
+
+
+# ============================================================
+# CELL 8 : PULL gttr_emd  (hotel wala hi logic)
+# ============================================================
+GTTR_COL = "gttr_emd"
+gttr_arr = df2[GTTR_COL].to_numpy()
+
+def pick_gttr(rows, found):
+    if not found or not rows:
+        return None
+    return gttr_arr[min(rows)]
+
+r1["gttr_emd"] = [
+    pick_gttr(rws, f) for rws, f in zip(r1["rows_vendor"], r1["vendor_found"])
+]
+print(r1["gttr_emd"].notna().sum(), "rows got gttr_emd")
