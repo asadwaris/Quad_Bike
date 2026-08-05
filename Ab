@@ -36,3 +36,35 @@ print(f'name-matched rows (n_rows>0)   : {(df["n_rows"] > 0).sum()}')
 print(f'survived date filter (>0)      : {(df["n_rows_date"] > 0).sum()}')
 print(f'total candidate rows after date: {df["n_rows_date"].sum():,}')
 print(df.loc[df['n_rows'] > 0, 'n_rows_date'].describe())
+
+
+
+
+
+DF_AMT  = 'transactionamount'   # <- df ka amount column (apne hisaab se set karo)
+SRC_AMT = 'inv_amt'             # <- source ka amount column
+BUFFER  = 10                    # +/- 10 dollar
+
+# amount numeric bana lo (invalid -> NaN)
+df[DF_AMT]      = pd.to_numeric(df[DF_AMT], errors='coerce')
+source[SRC_AMT] = pd.to_numeric(source[SRC_AMT], errors='coerce')
+
+# =====================================================
+# CELL 9 — amount filter: sirf n_rows_date > 0 wali rows pe
+# +/- BUFFER tolerance ke saath
+# =====================================================
+def filter_amount(r):
+    if not r['rows_date']:               # date pe 0-match -> chhod do
+        return []
+    sub  = source.loc[r['rows_date']]
+    keep = (sub[SRC_AMT] - r[DF_AMT]).abs() <= BUFFER
+    return sub.index[keep].tolist()
+
+df['rows_amount']   = df.progress_apply(filter_amount, axis=1)
+df['n_rows_amount'] = df['rows_amount'].str.len()
+
+print('--- amount filter summary ---')
+print(f'date-matched rows (n_rows_date>0) : {(df["n_rows_date"] > 0).sum()}')
+print(f'survived amount filter (>0)       : {(df["n_rows_amount"] > 0).sum()}')
+print(f'total candidate rows after amount : {df["n_rows_amount"].sum():,}')
+print(df.loc[df['n_rows_date'] > 0, 'n_rows_amount'].describe())
