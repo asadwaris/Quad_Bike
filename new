@@ -34,3 +34,22 @@ print(classification_report(y_test, pred))
 print("ROC-AUC:", round(roc_auc_score(y_test, proba_test), 4), "\n")
 print("Feature importance:\n",
       pd.Series(model.feature_importances_, index=X.columns).sort_values(ascending=False))
+
+
+
+# score full dataset
+data['match_probability'] = model.predict_proba(X)[:, 1]
+data['predicted_label'] = np.where(data['match_probability'] >= 0.5, 'Match', 'No Match')
+
+# confusion matrix on ALL rows (actual vs predicted)
+print("Confusion matrix (full dataset):\n",
+      confusion_matrix(data['target'], (data['match_probability'] >= 0.5).astype(int)), "\n")
+
+print(classification_report(
+    data['target'],
+    (data['match_probability'] >= 0.5).astype(int),
+    target_names=['No Match', 'Match']))
+
+# final output table
+result = data[['ind', 'Final_Classification', 'predicted_label', 'match_probability']]
+result
