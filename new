@@ -1,147 +1,33 @@
-import re
-import pandas as pd
+import numpy as np
 
-BRANDS = {
-    'NATIONAL':  ['national'],
-    'ENTERPRISE':['enterprise', 'enterpri'],
-    'HERTZ':     ['hertz'],
-    'BUDGET':    ['budget'],
-    'SIXT':      ['sixt'],
-    'AVIS':      ['avis'],
-    'THRIFTY':   ['thrifty'],
-    'DOLLAR':    ['dollar'],
-    'FOX':       ['fox'],
-    'PAYLESS':   ['payless'],
-    'EASIRENT':  ['easirent'],
-    'ALAMO':     ['alamo'],
-    'ADVANTAGE': ['advantage', 'advantag'],
-}
+# Step 1: lowercase both columns (handle NaN safely)
+df["name_clean"] = df["name"].fillna("").str.lower().str.strip()
+df["gttr_clean"] = df["gttr name"].fillna("").str.lower().str.strip()
 
-def parse_f2_code(s):
-    if not isinstance(s, str):
-        return None
-    s = s.strip().lstrip('*').strip()
-    if not s:
-        return None
-    parts = s.split()
-    return parts[0] if len(parts) >= 2 else (s[:-3] if len(s) > 3 else s)
+# Step 2: encode both columns in one batch each (with e5 prefix)
+emb_name = model.encode(
+    ["query: " + t for t in df["name_clean"]],
+    normalize_embeddings=True,
+    batch_size=64,
+    show_progress_bar=True,
+)
+emb_gttr = model.encode(
+    ["query: " + t for t in df["gttr_clean"]],
+    normalize_embeddings=True,
+    batch_size=64,
+    show_progress_bar=True,
+)
 
-def to_brand(text):
-    if not isinstance(text, str):
-        return None
-    for tok in re.sub(r'[^a-z]', ' ', text.lower()).split():
-        if len(tok) < 4:
-            continue
-        for canon, variants in BRANDS.items():
-            for v in variants:
-                if v.startswith(tok) or tok.startswith(v):
-                    return canon
-    return None
+# Step 3: row-wise cosine sim. Since vectors are normalized,
+# cosine = dot product = row-wise multiply then sum.
+df["similarity"] = np.sum(emb_name * emb_gttr, axis=1)
 
-# brand columns on both sides
-df2['f2_brand'] = df2['city_agcy_disp_cd'].map(parse_f2_code).map(to_brand)
-r1['f1_brand']  = r1['vendordescription'].map(to_brand)
-
-f2_brand_arr = df2['f2_brand'].to_numpy()
-
-print("f2 unresolved:", df2['f2_brand'].isna().mean().round(4))
-print("f1 unresolved (475 live):",
-      r1.loc[r1['rows_date'].map(len) > 0, 'f1_brand'].isna().mean().round(4))
-print(df2['f2_brand'].value_counts())
+print(df[["name", "gttr name", "similarity"]].head())
 
 
+def sim(a, b, prefix):
+    e = model.encode([prefix + a, prefix + b], normalize_embeddings=True)
+    return float(np.dot(e[0], e[1]))
 
-live = r1[r1['rows_date'].map(len) > 0]
-pairs = pd.DataFrame([
-    {'f1_vend': r['vendordescription'], 'f1_brand': r['f1_brand'],
-     'f2_code': df2['city_agcy_disp_cd'].iat[c], 'f2_brand': f2_brand_arr[c]}
-    for _, r in live.iterrows() for c in r['rows_date']
-])
-print(pd.crosstab(pairs['f1_brand'].fillna('NONE'), pairs['f2_brand'].fillna('NONE')))
-
-
-def vendor_filter(b, rows):
-    if not rows:
-        return set()
-    if b is None:
-        return set(rows)          # f1 brand unresolved -> keep all, decide later
-    return {r for r in rows if f2_brand_arr[r] == b}
-
-r1['rows_vendor']   = [vendor_filter(b, rws) for b, rws in zip(r1['f1_brand'], r1['rows_date'])]
-r1['n_cand_vendor'] = r1['rows_vendor'].map(len)
-r1['vendor_found']  = r1['n_cand_vendor'] > 0
-
-print(r1['date_found'].sum(), "->", r1['vendor_found'].sum())
-
-died = r1[r1['date_found'] & ~r1['vendor_found']]
-print(len(died))
-print(died[['vendordescription', 'f1_brand', 'n_cand_date']].head(20))
-AMOUNT_BUFFER = 5.0
-
-f2_brand_arr = df2['vendor'].to_numpy()
-f2_amt_arr   = pd.to_numeric(df2['amount'], errors='coerce').to_numpy()   # fix if amount col differs
-r1_amt_arr   = pd.to_numeric(r1['total_approved_amount'], errors='coerce').to_numpy()
-
-# --- vendor: read rows_date ---
-def vendor_filter(b, rows):
-    if not rows:
-        return set()
-    if pd.isna(b):
-        return set(rows)
-    return {r for r in rows if f2_brand_arr[r] == b}
-
-r1['rows_vendor']   = [vendor_filter(b, rws) for b, rws in zip(r1['vendor'], r1['rows_date'])]
-r1['n_cand_vendor'] = r1['rows_vendor'].map(len)
-r1['vendor_found']  = r1['n_cand_vendor'] > 0
-
-# --- amount: read rows_vendor ---
-def amount_filter(a, rows):
-    if not rows or pd.isna(a):
-        return set()
-    return {r for r in rows if not pd.isna(f2_amt_arr[r]) and abs(f2_amt_arr[r] - a) <= AMOUNT_BUFFER}
-
-r1['rows_amount']   = [amount_filter(a, rws) for a, rws in zip(r1_amt_arr, r1['rows_vendor'])]
-r1['n_cand_amount'] = r1['rows_amount'].map(len)
-r1['amount_found']  = r1['n_cand_amount'] > 0
-
-print("date  :", r1['date_found'].sum())
-print("vendor:", r1['vendor_found'].sum())
-print("amount:", r1['amount_found'].sum())
-
-
-
-
-f2_emb_arr = df2['emb'].to_numpy()
-
-def emb_match(e, rows):
-    if not rows:
-        return False
-    return any(f2_emb_arr[r] == e for r in rows)
-
-r1['match'] = [emb_match(e, rws) for e, rws in zip(r1['emb'], r1['rows_amount'])]
-
-print(r1['amount_found'].sum(), "candidates ->", r1['match'].sum(), "matched")
-print(r1.loc[r1['amount_found'], ['emb', 'n_cand_amount', 'match']])
-
-
-
-
-f2_emb_arr = df2['emb'].to_numpy()
-
-def pull_f2_emb(rows):
-    if not rows:
-        return None
-    vals = [f2_emb_arr[r] for r in rows]
-    return vals[0] if len(vals) == 1 else vals   # single -> scalar, multiple -> list
-
-r1['f2_emb'] = r1['rows_amount'].map(pull_f2_emb)
-
-print(r1.loc[r1['amount_found'], ['emb', 'f2_emb', 'n_cand_amount']])
-
-
-
-Hi Mayank,
-Please find the results attached. Quick summary of the approach:
-We started by filtering on name from the source data, then applied an exact match on invoice date. After that we matched on vendor, followed by amount with a $5 buffer.
-The CSV is attached — do let me know if anything needs to be adjusted or if you have any suggestions.
-Thanks
+print("with prefix:   ", sim("Uber ride",  "office rent payment", "query: "))
+print("without prefix:", sim("Uber ride",  "office rent payment", ""))
