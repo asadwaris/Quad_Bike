@@ -1,33 +1,36 @@
-import numpy as np
+import pandas as pd, numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
+from xgboost import XGBClassifier
 
-# Step 1: lowercase both columns (handle NaN safely)
-df["name_clean"] = df["name"].fillna("").str.lower().str.strip()
-df["gttr_clean"] = df["gttr name"].fillna("").str.lower().str.strip()
+data = sdf.copy()
+data['carRentalDays'] = data['carRentalDays'].fillna(0)
+data = data.dropna(subset=['Final_Classification'])
+data['target'] = (data['Final_Classification'] == 'Match').astype(int)
 
-# Step 2: encode both columns in one batch each (with e5 prefix)
-emb_name = model.encode(
-    ["query: " + t for t in df["name_clean"]],
-    normalize_embeddings=True,
-    batch_size=64,
-    show_progress_bar=True,
-)
-emb_gttr = model.encode(
-    ["query: " + t for t in df["gttr_clean"]],
-    normalize_embeddings=True,
-    batch_size=64,
-    show_progress_bar=True,
-)
+for c in ['name_match', 'date_match']:
+    data[c] = data[c].astype(int)
 
-# Step 3: row-wise cosine sim. Since vectors are normalized,
-# cosine = dot product = row-wise multiply then sum.
-df["similarity"] = np.sum(emb_name * emb_gttr, axis=1)
+X = data.drop(columns=['ind', 'Final_Classification', 'target'])
+y = data['target']
 
-print(df[["name", "gttr name", "similarity"]].head())
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=42)
 
+spw = (y_train == 0).sum() / (y_train == 1).sum()
 
-def sim(a, b, prefix):
-    e = model.encode([prefix + a, prefix + b], normalize_embeddings=True)
-    return float(np.dot(e[0], e[1]))
+model = XGBClassifier(
+    n_estimators=300, max_depth=4, learning_rate=0.1,
+    subsample=0.9, colsample_bytree=0.9,
+    scale_pos_weight=spw, eval_metric='logloss', random_state=42)
+model.fit(X_train, y_train)
 
-print("with prefix:   ", sim("Uber ride",  "office rent payment", "query: "))
-print("without prefix:", sim("Uber ride",  "office rent payment", ""))
+# --- probabilities ---
+proba_test = model.predict_proba(X_test)[:, 1]   # P(Match)
+pred = (proba_test >= 0.5).astype(int)
+
+print("Confusion matrix:\n", confusion_matrix(y_test, pred), "\n")
+print(classification_report(y_test, pred))
+print("ROC-AUC:", round(roc_auc_score(y_test, proba_test), 4), "\n")
+print("Feature importance:\n",
+      pd.Series(model.feature_importances_, index=X.columns).sort_values(ascending=False))
