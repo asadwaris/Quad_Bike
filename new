@@ -53,3 +53,12 @@ print(classification_report(
 # final output table
 result = data[['ind', 'Final_Classification', 'predicted_label', 'match_probability']]
 result
+
+
+Hi Mayank,
+
+Data cleaning done and I've trained an XGBoost model. It's giving 100% accuracy on both train and test sets, with prediction probabilities above 0.90.
+
+One thing to flag: the accuracy is this high most likely because of a direct correlation in the data — wherever name_match and date_match (rental-to-return date overlap) are both True, the record is a Match. So the model is essentially learning that rule, which is why XGBoost fits it so well.
+
+Happy to walk through it or build an alternate version if needed.
