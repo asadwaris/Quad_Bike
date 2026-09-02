@@ -86,3 +86,22 @@ test_df["pred"]   = pred_test
 
 results = pd.concat([train_df, test_df], ignore_index=True)
 results["correct"] = results["y_true"] == results["pred"]   # True / False
+
+
+
+
+# predictions (same 0.90 threshold)
+pred_train = (model.predict_proba(X_train)[:, 1] >= 0.90).astype(int)
+pred_test  = (model.predict_proba(X_test)[:, 1]  >= 0.90).astype(int)
+
+# 1) split column
+data.loc[X_train.index, "split"] = "train"
+data.loc[X_test.index,  "split"] = "test"
+
+# 2) pred column
+data.loc[X_train.index, "pred"] = pred_train
+data.loc[X_test.index,  "pred"] = pred_test
+data["pred"] = data["pred"].astype(int)
+
+# 3) correct: True / False
+data["correct"] = data["pred"] == data["target"]
