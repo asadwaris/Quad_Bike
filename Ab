@@ -68,3 +68,21 @@ print(f'date-matched rows (n_rows_date>0) : {(df["n_rows_date"] > 0).sum()}')
 print(f'survived amount filter (>0)       : {(df["n_rows_amount"] > 0).sum()}')
 print(f'total candidate rows after amount : {df["n_rows_amount"].sum():,}')
 print(df.loc[df['n_rows_date'] > 0, 'n_rows_amount'].describe())
+import pandas as pd
+
+# predict on both splits (same 0.90 threshold you used)
+pred_train = (model.predict_proba(X_train)[:, 1] >= 0.90).astype(int)
+pred_test  = (model.predict_proba(X_test)[:, 1]  >= 0.90).astype(int)
+
+train_df = X_train.copy()
+train_df["split"]  = "train"
+train_df["y_true"] = y_train.values
+train_df["pred"]   = pred_train
+
+test_df = X_test.copy()
+test_df["split"]  = "test"
+test_df["y_true"] = y_test.values
+test_df["pred"]   = pred_test
+
+results = pd.concat([train_df, test_df], ignore_index=True)
+results["correct"] = results["y_true"] == results["pred"]   # True / False
