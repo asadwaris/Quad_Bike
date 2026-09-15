@@ -1,0 +1,810 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Record review</title>
+
+<!-- HANDOVER SWAP: replace this CDN tag with the inlined library.
+     Download https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js
+     and paste its contents between a bare <script> ... </script> here. -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+
+<style>
+:root{
+  --ink:#1c1f23; --ink-soft:#5b6470; --ink-faint:#8a939f;
+  --line:#dfe3e8; --line-soft:#eceff2;
+  --paper:#ffffff; --panel:#f6f7f9;
+  --act:#1f5f8b; --act-soft:#e8f0f6;
+  --dirty:#9a6206; --dirty-soft:#fdf3e0;
+  --stop:#a3352c; --stop-soft:#fbeceb;
+  --ok:#2f6b46; --ok-soft:#e9f3ec;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--panel);color:var(--ink);
+  font:14px/1.5 "Segoe UI",system-ui,-apple-system,sans-serif;
+  display:flex;flex-direction:column;overflow:hidden}
+button{font:inherit;color:inherit;background:var(--paper);border:1px solid var(--line);
+  border-radius:3px;padding:5px 11px;cursor:pointer}
+button:hover:not(:disabled){border-color:var(--ink-faint);background:var(--panel)}
+button:disabled{opacity:.45;cursor:default}
+button.act{background:var(--act);border-color:var(--act);color:#fff}
+button.act:hover:not(:disabled){background:#194e73;border-color:#194e73}
+button.on{background:var(--act-soft);border-color:#b9d2e3;color:var(--act)}
+input[type=text],input[type=number],select{font:inherit;padding:5px 8px;
+  border:1px solid var(--line);border-radius:3px;background:var(--paper);color:inherit}
+:focus-visible{outline:2px solid var(--act);outline-offset:1px}
+.spacer{flex:1}
+.hidden{display:none !important}
+.meta{color:var(--ink-soft);font-size:13px}
+
+header{display:flex;align-items:center;gap:10px;padding:10px 16px;background:var(--paper);
+  border-bottom:1px solid var(--line);flex:0 0 auto}
+header h1{font-size:15px;font-weight:600;margin:0;letter-spacing:-.01em}
+.badge{font-size:12px;padding:2px 8px;border-radius:3px;background:var(--dirty-soft);
+  color:var(--dirty);border:1px solid #f0dcb4}
+.viewtabs{display:flex;gap:4px;margin-left:6px}
+
+main{flex:1;display:flex;min-height:0}
+aside{width:270px;flex:0 0 auto;background:var(--paper);border-right:1px solid var(--line);
+  display:flex;flex-direction:column;min-height:0}
+.aside-head{padding:11px 14px 9px;border-bottom:1px solid var(--line-soft)}
+.aside-head h2{font-size:13px;font-weight:600;margin:0 0 2px}
+.aside-head p{margin:0;font-size:12px;color:var(--ink-faint)}
+#collist{flex:1;overflow-y:auto;padding:6px 8px}
+.colrow{display:flex;align-items:center;gap:7px;padding:5px 7px;border-radius:3px;
+  cursor:grab;font-size:13px;border:1px solid transparent}
+.colrow:hover{background:var(--panel)}
+.colrow.drag{opacity:.35}
+.colrow.over{border-top:2px solid var(--act)}
+.grip{color:var(--line);flex:0 0 auto;letter-spacing:-2px;font-size:15px}
+.colrow label{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;cursor:pointer}
+.colrow.off label{color:var(--ink-faint);text-decoration:line-through}
+.tag{font-size:10px;color:var(--act);background:var(--act-soft);padding:1px 5px;
+  border-radius:2px;flex:0 0 auto}
+.aside-foot{border-top:1px solid var(--line-soft);padding:10px 12px;display:flex;gap:6px}
+.aside-foot input{flex:1;min-width:0}
+
+section.pane{flex:1;display:flex;flex-direction:column;min-width:0}
+.bar{display:flex;align-items:center;gap:10px;padding:8px 14px;background:var(--paper);
+  border-bottom:1px solid var(--line);font-size:13px;flex:0 0 auto}
+.body{flex:1;overflow:auto;background:var(--paper)}
+
+table{border-collapse:separate;border-spacing:0;font-size:13px}
+th,td{border-right:1px solid var(--line-soft);border-bottom:1px solid var(--line-soft);
+  padding:5px 9px;text-align:left;white-space:nowrap;max-width:280px;
+  overflow:hidden;text-overflow:ellipsis}
+th{position:sticky;top:0;z-index:2;background:var(--panel);font-weight:600;
+  border-bottom:1px solid var(--line)}
+th.rn,td.rn{position:sticky;left:0;z-index:1;background:var(--panel);color:var(--ink-faint);
+  text-align:right;font-variant-numeric:tabular-nums;border-right:1px solid var(--line);
+  min-width:52px}
+th.rn{z-index:3}
+td[contenteditable]:focus{outline:2px solid var(--act);outline-offset:-2px;
+  overflow:visible;background:var(--paper)}
+td.edited{background:var(--dirty-soft)}
+tbody tr:hover td:not(.rn){background:#fafbfc}
+
+/* layout builder */
+.builder{padding:16px 18px;max-width:1080px}
+.builder h2{font-size:15px;font-weight:600;margin:0 0 3px}
+.builder p.lede{margin:0 0 16px;font-size:13px;color:var(--ink-soft);max-width:66ch}
+.buckets{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+.bucket{background:var(--panel);border:1px solid var(--line);border-radius:4px;
+  display:flex;flex-direction:column;min-height:190px}
+.bucket h3{font-size:12px;font-weight:600;margin:0;padding:8px 10px;
+  border-bottom:1px solid var(--line);color:var(--ink-soft)}
+.bucket .items{flex:1;padding:6px;display:flex;flex-direction:column;gap:4px}
+.bucket.hot{border-color:var(--act);background:var(--act-soft)}
+.chip{background:var(--paper);border:1px solid var(--line);border-radius:3px;
+  padding:5px 8px;font-size:12.5px;cursor:grab;display:flex;align-items:center;gap:6px;
+  overflow:hidden}
+.chip span.nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chip.drag{opacity:.35}
+.chip.over{border-top:2px solid var(--act)}
+.chip.gap{border-style:dashed;color:var(--ink-faint);background:transparent}
+.chip .ty{font-size:10px;color:var(--ink-faint);flex:0 0 auto}
+.builder .tools{display:flex;gap:8px;align-items:center;margin:14px 0 18px;flex-wrap:wrap}
+.preview{border:1px solid var(--line);border-radius:4px;background:var(--paper)}
+.preview .prow{display:grid;grid-template-columns:minmax(0,1fr) 74px minmax(0,1fr);
+  gap:10px;align-items:center;padding:7px 12px;border-bottom:1px solid var(--line-soft);
+  font-size:13px}
+.preview .prow:last-child{border-bottom:none}
+.preview .prow .mid{text-align:center;color:var(--ink-faint);font-size:11px}
+.preview .prow.full{grid-template-columns:1fr}
+.preview .prow.warn{background:var(--stop-soft)}
+.sechead{font-size:12px;font-weight:600;color:var(--ink-soft);margin:0 0 6px}
+
+/* row view */
+.rowview{padding:18px;max-width:940px;margin:0 auto}
+.pair{display:grid;grid-template-columns:minmax(0,1fr) 96px minmax(0,1fr);gap:12px;
+  align-items:stretch;margin-bottom:8px}
+.pair.full{grid-template-columns:1fr}
+.cell{border:1px solid var(--line);border-radius:4px;padding:7px 10px;background:var(--paper);
+  min-width:0}
+.cell .fl{font-size:11px;color:var(--ink-faint);margin-bottom:2px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cell .val{font-size:14px;min-height:21px;word-break:break-word;outline:none}
+.cell .val:focus{outline:2px solid var(--act);outline-offset:2px}
+.cell.edited{background:var(--dirty-soft);border-color:#eccf95}
+.verdict{display:flex;align-items:center;justify-content:center;font-size:11px;
+  border-radius:3px;padding:0 6px;text-align:center}
+.verdict.same{background:var(--ok-soft);color:var(--ok)}
+.verdict.diff{background:var(--stop-soft);color:var(--stop)}
+.verdict.na{color:var(--ink-faint)}
+.jump{width:88px}
+
+.empty{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:14px;color:var(--ink-soft);text-align:center;padding:40px}
+.empty h2{margin:0;font-size:17px;font-weight:600;color:var(--ink)}
+.empty p{margin:0;max-width:46ch;font-size:13px}
+.err{color:var(--stop);font-size:13px}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Record review</h1>
+  <span class="meta" id="fileinfo">No file loaded</span>
+  <span class="badge hidden" id="dirtyflag">Unsaved edits</span>
+  <div class="viewtabs hidden" id="tabs">
+    <button id="tabTable" class="on">Table</button>
+    <button id="tabLayout">Layout</button>
+    <button id="tabRow">Row view</button>
+  </div>
+  <span class="spacer"></span>
+  <label for="sheetsel" class="meta hidden" id="sheetlbl">Sheet</label>
+  <select id="sheetsel" class="hidden"></select>
+  <input type="file" id="picker" accept=".xlsx,.xlsm,.xls,.csv" class="hidden">
+  <input type="file" id="layoutpicker" accept=".json" class="hidden">
+  <button id="openbtn">Open file</button>
+  <button id="savebtn" class="act" disabled>Save a copy</button>
+</header>
+
+<main>
+  <aside id="sidebar" class="hidden">
+    <div class="aside-head">
+      <h2>Columns</h2>
+      <p>Drag to reorder. Untick to hide.</p>
+    </div>
+    <div id="collist"></div>
+    <div class="aside-foot">
+      <input type="text" id="newcol" placeholder="New column name">
+      <button id="addcol">Add</button>
+    </div>
+  </aside>
+
+  <section class="pane">
+    <div class="bar hidden" id="tablebar">
+      <button id="prev">Previous</button>
+      <button id="next">Next</button>
+      <span class="meta" id="pageinfo"></span>
+      <span class="spacer"></span>
+      <span class="meta" id="colinfo"></span>
+    </div>
+
+    <div class="bar hidden" id="rowbar">
+      <button id="rprev">Previous</button>
+      <button id="rnext">Next</button>
+      <span class="meta" id="rowinfo"></span>
+      <input type="number" id="jump" class="jump" min="1" placeholder="Go to">
+      <button id="jumpgo">Go</button>
+      <span class="spacer"></span>
+      <span class="meta" id="diffinfo"></span>
+    </div>
+
+    <div class="body" id="body">
+      <div class="empty" id="empty">
+        <h2>Open a spreadsheet to begin</h2>
+        <p>Reads .xlsx, .xlsm and .csv. Everything stays on this machine &mdash;
+           the file is never uploaded anywhere.</p>
+        <button id="openbtn2" class="act">Open file</button>
+        <p class="err hidden" id="loaderr"></p>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+var PAGE = 100;
+var GAP = "__gap__";
+
+var st = {
+  wb:null, sheetName:null, isCsv:false, fileName:"",
+  cols:[], rows:[], order:[], hidden:{}, added:{}, types:{},
+  edited:{}, page:0, dirty:false,
+  view:"table",
+  layout:null,       /* {left:[], right:[], full:[], hidden:[]} */
+  draft:null,
+  rowIdx:0
+};
+
+function $(id){ return document.getElementById(id); }
+function esc(s){ return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+function pad(n){ return n<10 ? "0"+n : ""+n; }
+function show(v){
+  if (v===null||v===undefined) return "";
+  if (v instanceof Date) return v.getFullYear()+"-"+pad(v.getMonth()+1)+"-"+pad(v.getDate());
+  return String(v);
+}
+function nameOf(id){
+  if (id===GAP) return "\u2014";
+  for (var i=0;i<st.cols.length;i++) if (st.cols[i].id===id) return st.cols[i].name;
+  return id;
+}
+function visible(){ return st.order.filter(function(id){ return !st.hidden[id]; }); }
+
+/* ---------- loading ---------- */
+
+function openPicker(){ $("picker").value=""; $("picker").click(); }
+$("openbtn").onclick = openPicker;
+$("openbtn2").onclick = openPicker;
+
+$("picker").onchange = function(e){
+  var f = e.target.files[0];
+  if (!f) return;
+  $("loaderr").classList.add("hidden");
+  var r = new FileReader();
+  r.onload = function(ev){
+    try {
+      st.wb = XLSX.read(new Uint8Array(ev.target.result),
+        {type:"array", cellDates:true, cellNF:false, cellText:false});
+      st.fileName = f.name;
+      st.isCsv = /\.csv$/i.test(f.name);
+      buildSheetList();
+      loadSheet(st.wb.SheetNames[0]);
+    } catch(err){
+      $("loaderr").textContent = "Could not read that file. " + err.message;
+      $("loaderr").classList.remove("hidden");
+    }
+  };
+  r.onerror = function(){
+    $("loaderr").textContent = "Could not read that file from disk.";
+    $("loaderr").classList.remove("hidden");
+  };
+  r.readAsArrayBuffer(f);
+};
+
+function buildSheetList(){
+  var sel = $("sheetsel"); sel.innerHTML = "";
+  st.wb.SheetNames.forEach(function(n){
+    var o=document.createElement("option"); o.value=n; o.textContent=n; sel.appendChild(o);
+  });
+  var many = st.wb.SheetNames.length>1;
+  sel.classList.toggle("hidden", !many);
+  $("sheetlbl").classList.toggle("hidden", !many);
+}
+
+$("sheetsel").onchange = function(e){
+  if (st.dirty && !confirm("Switching sheets discards unsaved edits. Continue?")){
+    e.target.value = st.sheetName; return;
+  }
+  loadSheet(e.target.value);
+};
+
+function loadSheet(name){
+  var aoa = XLSX.utils.sheet_to_json(st.wb.Sheets[name],
+    {header:1, defval:null, blankrows:false, raw:true});
+  st.sheetName=name; st.rows=[]; st.cols=[]; st.order=[];
+  st.hidden={}; st.added={}; st.edited={}; st.types={};
+  st.page=0; st.rowIdx=0; st.layout=null; st.draft=null;
+  setDirty(false);
+
+  var head = aoa.length ? aoa[0] : [];
+  head.forEach(function(h,i){
+    var id="c"+i;
+    st.cols.push({id:id, name:(h===null||h==="")?("Column "+(i+1)):String(h)});
+    st.order.push(id);
+  });
+  for (var r=1;r<aoa.length;r++){
+    var src=aoa[r], row={};
+    for (var c=0;c<st.cols.length;c++) row[st.cols[c].id] = src[c]===undefined?null:src[c];
+    st.rows.push(row);
+  }
+  detectTypes();
+
+  $("fileinfo").textContent = st.fileName+" \u2014 "+name+" \u2014 "+
+    st.rows.length.toLocaleString()+" rows";
+  $("sheetsel").value = name;
+  $("empty").classList.add("hidden");
+  $("sidebar").classList.remove("hidden");
+  $("tabs").classList.remove("hidden");
+  $("savebtn").disabled = false;
+  renderSidebar();
+  setView("table");
+}
+
+function detectTypes(){
+  var sample = Math.min(st.rows.length, 80);
+  st.cols.forEach(function(c){
+    var d=0,n=0,seen=0;
+    for (var i=0;i<sample;i++){
+      var v = st.rows[i][c.id];
+      if (v===null||v==="") continue;
+      seen++;
+      if (v instanceof Date) d++;
+      else if (typeof v === "number") n++;
+    }
+    st.types[c.id] = !seen ? "text" : (d/seen>.6 ? "date" : (n/seen>.6 ? "num" : "text"));
+  });
+}
+
+/* ---------- sidebar ---------- */
+
+var dragId = null;
+
+function renderSidebar(){
+  var box=$("collist"); box.innerHTML="";
+  st.order.forEach(function(id){
+    var row=document.createElement("div");
+    row.className="colrow"+(st.hidden[id]?" off":"");
+    row.draggable=true; row.dataset.id=id;
+
+    var grip=document.createElement("span");
+    grip.className="grip"; grip.textContent="\u22ee\u22ee"; grip.setAttribute("aria-hidden","true");
+
+    var cb=document.createElement("input");
+    cb.type="checkbox"; cb.checked=!st.hidden[id]; cb.id="chk_"+id;
+    cb.onchange=function(){
+      if (cb.checked) delete st.hidden[id]; else st.hidden[id]=true;
+      row.classList.toggle("off",!cb.checked);
+      if (st.view==="table") renderTable();
+    };
+
+    var lab=document.createElement("label");
+    lab.htmlFor=cb.id; lab.textContent=nameOf(id); lab.title=nameOf(id);
+
+    row.appendChild(grip); row.appendChild(cb); row.appendChild(lab);
+    if (st.added[id]){
+      var t=document.createElement("span"); t.className="tag"; t.textContent="new";
+      row.appendChild(t);
+    }
+
+    row.ondragstart=function(e){ dragId=id; row.classList.add("drag");
+      e.dataTransfer.effectAllowed="move"; e.dataTransfer.setData("text/plain",id); };
+    row.ondragend=function(){ dragId=null; row.classList.remove("drag"); clearOver(); };
+    row.ondragover=function(e){ e.preventDefault();
+      if (dragId&&dragId!==id){ clearOver(); row.classList.add("over"); } };
+    row.ondrop=function(e){
+      e.preventDefault(); clearOver();
+      if (!dragId||dragId===id) return;
+      st.order.splice(st.order.indexOf(dragId),1);
+      st.order.splice(st.order.indexOf(id),0,dragId);
+      renderSidebar();
+      if (st.view==="table") renderTable();
+    };
+    box.appendChild(row);
+  });
+}
+function clearOver(){
+  var m=document.querySelectorAll(".colrow.over,.chip.over");
+  for (var i=0;i<m.length;i++) m[i].classList.remove("over");
+}
+
+$("addcol").onclick=function(){
+  var inp=$("newcol"), name=inp.value.trim();
+  if (!name){ inp.focus(); return; }
+  var id="n"+Date.now();
+  st.cols.push({id:id,name:name}); st.order.push(id);
+  st.added[id]=true; st.types[id]="text";
+  st.rows.forEach(function(r){ r[id]=null; });
+  if (st.layout) st.layout.full.push(id);
+  if (st.draft) st.draft.full.push(id);
+  inp.value=""; setDirty(true);
+  renderSidebar(); rerender();
+};
+$("newcol").onkeydown=function(e){ if (e.key==="Enter") $("addcol").click(); };
+
+/* ---------- views ---------- */
+
+$("tabTable").onclick=function(){ setView("table"); };
+$("tabLayout").onclick=function(){ setView("layout"); };
+$("tabRow").onclick=function(){
+  if (!st.layout){ setView("layout"); return; }
+  setView("row");
+};
+
+function setView(v){
+  st.view=v;
+  $("tabTable").classList.toggle("on",v==="table");
+  $("tabLayout").classList.toggle("on",v==="layout");
+  $("tabRow").classList.toggle("on",v==="row");
+  $("tablebar").classList.toggle("hidden",v!=="table");
+  $("rowbar").classList.toggle("hidden",v!=="row");
+  $("sidebar").classList.toggle("hidden",v!=="table");
+  rerender();
+}
+function rerender(){
+  if (st.view==="table") renderTable();
+  else if (st.view==="layout") renderBuilder();
+  else renderRow();
+}
+
+/* ---------- table view ---------- */
+
+function renderTable(){
+  var vis=visible(), start=st.page*PAGE, end=Math.min(start+PAGE,st.rows.length);
+  var html="<table><thead><tr><th class='rn'>#</th>";
+  vis.forEach(function(id){ html+="<th>"+esc(nameOf(id))+"</th>"; });
+  html+="</tr></thead><tbody>";
+  for (var r=start;r<end;r++){
+    html+="<tr><td class='rn'>"+(r+1)+"</td>";
+    for (var i=0;i<vis.length;i++){
+      var id=vis[i], cls=st.edited[r+":"+id]?" class='edited'":"";
+      html+="<td contenteditable='true' data-r='"+r+"' data-c='"+id+"'"+cls+">"+
+            esc(show(st.rows[r][id]))+"</td>";
+    }
+    html+="</tr>";
+  }
+  html+="</tbody></table>";
+  $("body").innerHTML=html;
+  $("body").scrollTop=0;
+
+  $("pageinfo").textContent = st.rows.length
+    ? "Rows "+(start+1).toLocaleString()+"\u2013"+end.toLocaleString()+
+      " of "+st.rows.length.toLocaleString() : "No rows";
+  $("colinfo").textContent = vis.length+" of "+st.cols.length+" columns shown";
+  $("prev").disabled = st.page===0;
+  $("next").disabled = end>=st.rows.length;
+}
+/* One listener, bound once, serving both the table cells and the row-view
+   fields. Both carry data-r / data-c, so the handler doesn't care which
+   view produced the element. */
+function onEdit(e){
+  var el=e.target;
+  if (!el.dataset || el.dataset.r===undefined) return;
+  var r=+el.dataset.r, id=el.dataset.c;
+  st.rows[r][id]=el.textContent;
+  st.edited[r+":"+id]=true;
+  if (el.tagName==="TD") el.classList.add("edited");
+  else if (el.parentNode) el.parentNode.classList.add("edited");
+  setDirty(true);
+  if (st.view==="row") updateVerdicts();
+}
+$("body").addEventListener("input", onEdit);
+$("prev").onclick=function(){ if (st.page>0){ st.page--; renderTable(); } };
+$("next").onclick=function(){ if ((st.page+1)*PAGE<st.rows.length){ st.page++; renderTable(); } };
+
+/* ---------- pairing suggestion ---------- */
+
+function tokens(s){
+  return s.replace(/([a-z])([A-Z])/g,"$1 $2").toLowerCase()
+          .split(/[^a-z0-9]+/).filter(function(t){ return t.length>1; });
+}
+function bigrams(s){
+  s=s.toLowerCase().replace(/[^a-z0-9]/g,"");
+  var out=[]; for (var i=0;i<s.length-1;i++) out.push(s.substr(i,2));
+  return out;
+}
+function dice(a,b){
+  var A=bigrams(a), B=bigrams(b);
+  if (!A.length||!B.length) return 0;
+  var m={},hit=0;
+  A.forEach(function(g){ m[g]=(m[g]||0)+1; });
+  B.forEach(function(g){ if (m[g]>0){ m[g]--; hit++; } });
+  return 2*hit/(A.length+B.length);
+}
+function affinity(a,b){
+  var ta=tokens(nameOf(a)), tb=tokens(nameOf(b)), shared=0;
+  ta.forEach(function(t){ if (tb.indexOf(t)>-1) shared++; });
+  var tok = shared / Math.max(1, Math.min(ta.length,tb.length));
+  return dice(nameOf(a),nameOf(b))*0.35 + tok*0.35 +
+         (st.types[a]===st.types[b] ? 0.30 : 0);
+}
+function suggestLayout(){
+  var pool = visible().slice(), left=[], right=[], used={};
+  var scored=[];
+  for (var i=0;i<pool.length;i++)
+    for (var j=i+1;j<pool.length;j++)
+      scored.push({a:pool[i], b:pool[j], s:affinity(pool[i],pool[j])});
+  scored.sort(function(x,y){ return y.s-x.s; });
+  scored.forEach(function(p){
+    if (p.s<0.42||used[p.a]||used[p.b]) return;
+    used[p.a]=used[p.b]=true; left.push(p.a); right.push(p.b);
+  });
+  var full = pool.filter(function(id){ return !used[id]; });
+  var hid  = st.order.filter(function(id){ return st.hidden[id]; });
+  return {left:left, right:right, full:full, hidden:hid};
+}
+
+/* ---------- layout builder ---------- */
+
+var BUCKETS=[["left","Left"],["right","Right"],["full","Full width"],["hidden","Hidden"]];
+var dragFrom=null, dragChip=null;
+
+function renderBuilder(){
+  if (!st.draft) st.draft = st.layout ? clone(st.layout) : suggestLayout();
+  var d = reconcile(st.draft);
+
+  var h='<div class="builder"><h2>Row layout</h2>'+
+    '<p class="lede">Drag a column into Left or Right to pair it. Pairing is by position &mdash; '+
+    'the first item on the left faces the first on the right. Drop a spacer in to realign.</p>'+
+    '<div class="buckets">';
+  BUCKETS.forEach(function(b){
+    h+='<div class="bucket" data-b="'+b[0]+'"><h3>'+b[1]+' ('+d[b[0]].length+')</h3>'+
+       '<div class="items" data-b="'+b[0]+'">';
+    d[b[0]].forEach(function(id,i){
+      h+='<div class="chip'+(id===GAP?" gap":"")+'" draggable="true" data-b="'+b[0]+
+         '" data-i="'+i+'"><span class="grip" aria-hidden="true">\u22ee\u22ee</span>'+
+         '<span class="nm">'+esc(nameOf(id))+'</span>'+
+         (id===GAP?"":'<span class="ty">'+st.types[id]+'</span>')+'</div>';
+    });
+    h+='</div></div>';
+  });
+  h+='</div>';
+
+  h+='<div class="tools">'+
+     '<button id="addgapL">Add spacer left</button>'+
+     '<button id="addgapR">Add spacer right</button>'+
+     '<button id="resuggest">Suggest pairs again</button>'+
+     '<span class="spacer"></span>'+
+     '<button id="loadlayout">Load layout</button>'+
+     '<button id="dllayout">Save layout file</button>'+
+     '<button id="uselayout" class="act">Use this layout</button>'+
+     '</div>';
+
+  var n=Math.max(d.left.length,d.right.length);
+  h+='<p class="sechead">Preview</p><div class="preview">';
+  if (!n && !d.full.length) h+='<div class="prow full">Nothing selected yet.</div>';
+  for (var i=0;i<n;i++){
+    var L=d.left[i], R=d.right[i];
+    var bad=(L===undefined||R===undefined||L===GAP||R===GAP);
+    h+='<div class="prow'+(bad?" warn":"")+'"><span>'+esc(L===undefined?"\u2014":nameOf(L))+
+       '</span><span class="mid">faces</span><span>'+
+       esc(R===undefined?"\u2014":nameOf(R))+'</span></div>';
+  }
+  d.full.forEach(function(id){
+    h+='<div class="prow full">'+esc(nameOf(id))+'</div>';
+  });
+  h+='</div></div>';
+
+  $("body").innerHTML=h;
+  wireBuilder();
+}
+
+function clone(o){ return JSON.parse(JSON.stringify(o)); }
+
+/* Every live column must sit in exactly one bucket. Drops columns that no
+   longer exist, de-duplicates, and parks anything new in Full width so an
+   added column can never vanish from the row view. */
+function reconcile(L){
+  var live={}, seen={};
+  st.cols.forEach(function(c){ live[c.id]=true; });
+  ["left","right","full","hidden"].forEach(function(k){
+    L[k] = (L[k]||[]).filter(function(id){
+      if (id===GAP) return true;
+      if (!live[id] || seen[id]) return false;
+      seen[id]=true; return true;
+    });
+  });
+  st.cols.forEach(function(c){ if (!seen[c.id]) L.full.push(c.id); });
+  return L;
+}
+
+function wireBuilder(){
+  var chips=$("body").querySelectorAll(".chip");
+  for (var i=0;i<chips.length;i++){
+    (function(chip){
+      chip.ondragstart=function(e){
+        dragFrom=chip.dataset.b; dragChip=+chip.dataset.i;
+        chip.classList.add("drag"); e.dataTransfer.effectAllowed="move";
+        e.dataTransfer.setData("text/plain","x");
+      };
+      chip.ondragend=function(){ chip.classList.remove("drag"); clearOver(); };
+      chip.ondragover=function(e){ e.preventDefault(); clearOver(); chip.classList.add("over"); };
+      chip.ondrop=function(e){
+        e.preventDefault(); e.stopPropagation(); clearOver();
+        moveChip(chip.dataset.b, +chip.dataset.i);
+      };
+    })(chips[i]);
+  }
+  var zones=$("body").querySelectorAll(".items");
+  for (var j=0;j<zones.length;j++){
+    (function(z){
+      z.ondragover=function(e){ e.preventDefault(); z.parentNode.classList.add("hot"); };
+      z.ondragleave=function(){ z.parentNode.classList.remove("hot"); };
+      z.ondrop=function(e){
+        e.preventDefault(); z.parentNode.classList.remove("hot");
+        moveChip(z.dataset.b, st.draft[z.dataset.b].length);
+      };
+    })(zones[j]);
+  }
+
+  $("addgapL").onclick=function(){ st.draft.left.push(GAP); renderBuilder(); };
+  $("addgapR").onclick=function(){ st.draft.right.push(GAP); renderBuilder(); };
+  $("resuggest").onclick=function(){ st.draft=suggestLayout(); renderBuilder(); };
+  $("dllayout").onclick=downloadLayout;
+  $("loadlayout").onclick=function(){ $("layoutpicker").value=""; $("layoutpicker").click(); };
+  $("uselayout").onclick=function(){
+    st.layout=clone(st.draft);
+    st.layout.hidden.forEach(function(id){ st.hidden[id]=true; });
+    renderSidebar();
+    st.rowIdx=0;
+    setView("row");
+  };
+}
+
+function moveChip(toB, toI){
+  if (dragFrom===null) return;
+  var src=st.draft[dragFrom];
+  var item=src[dragChip];
+  if (item===undefined) return;
+  src.splice(dragChip,1);
+  if (dragFrom===toB && dragChip<toI) toI--;
+  st.draft[toB].splice(toI,0,item);
+  dragFrom=null; dragChip=null;
+  renderBuilder();
+}
+
+function downloadLayout(){
+  var payload = {
+    version: 1,
+    savedAt: new Date().toISOString(),
+    sourceFile: st.fileName,
+    sheet: st.sheetName,
+    columns: st.cols.map(function(c){ return c.name; }),
+    left:   st.draft.left.map(nameOf),
+    right:  st.draft.right.map(nameOf),
+    full:   st.draft.full.map(nameOf),
+    hidden: st.draft.hidden.map(nameOf)
+  };
+  var blob=new Blob([JSON.stringify(payload,null,2)],{type:"application/json"});
+  var a=document.createElement("a");
+  a.href=URL.createObjectURL(blob);
+  a.download=st.fileName.replace(/\.[^.]+$/,"")+"_layout.json";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+$("layoutpicker").onchange=function(e){
+  var f=e.target.files[0]; if (!f) return;
+  var r=new FileReader();
+  r.onload=function(ev){
+    try {
+      var p=JSON.parse(ev.target.result);
+      var byName={}, missing=[];
+      st.cols.forEach(function(c){ byName[c.name]=c.id; });
+      function map(list){
+        return (list||[]).map(function(nm){
+          if (nm==="\u2014") return GAP;
+          if (byName[nm]) return byName[nm];
+          missing.push(nm); return null;
+        }).filter(function(x){ return x!==null; });
+      }
+      var d={left:map(p.left), right:map(p.right), full:map(p.full), hidden:map(p.hidden)};
+      var placed={};
+      ["left","right","full","hidden"].forEach(function(k){
+        d[k].forEach(function(id){ if (id!==GAP) placed[id]=true; });
+      });
+      st.cols.forEach(function(c){ if (!placed[c.id]) d.full.push(c.id); });
+      st.draft=d;
+      renderBuilder();
+      if (missing.length)
+        alert("Layout loaded. These columns are not in this file and were skipped:\n\n"+
+              missing.join("\n"));
+    } catch(err){
+      alert("That layout file could not be read. "+err.message);
+    }
+  };
+  r.readAsText(f);
+};
+
+/* ---------- row view ---------- */
+
+function norm(v){
+  if (v===null||v===undefined) return "";
+  if (v instanceof Date) return show(v);
+  return String(v).trim().toLowerCase().replace(/\s+/g," ");
+}
+
+function renderRow(){
+  if (!st.rows.length){ $("body").innerHTML='<div class="empty"><p>No rows.</p></div>'; return; }
+  if (st.rowIdx<0) st.rowIdx=0;
+  if (st.rowIdx>=st.rows.length) st.rowIdx=st.rows.length-1;
+
+  var L=reconcile(st.layout), r=st.rowIdx, row=st.rows[r];
+  var n=Math.max(L.left.length,L.right.length), diffs=0;
+  var h='<div class="rowview">';
+
+  for (var i=0;i<n;i++){
+    var a=L.left[i], b=L.right[i];
+    var av=a&&a!==GAP?show(row[a]):"", bv=b&&b!==GAP?show(row[b]):"";
+    var cmp="na", txt="\u2014";
+    if (a&&b&&a!==GAP&&b!==GAP){
+      var same = norm(row[a])===norm(row[b]);
+      cmp = same?"same":"diff";
+      txt = same?"match":"differs";
+      if (!same) diffs++;
+    }
+    h+='<div class="pair">'+cellHtml(r,a,av)+
+       '<div class="verdict '+cmp+'">'+txt+'</div>'+cellHtml(r,b,bv)+'</div>';
+  }
+  L.full.forEach(function(id){
+    h+='<div class="pair full">'+cellHtml(r,id,show(row[id]))+'</div>';
+  });
+  h+='</div>';
+
+  $("body").innerHTML=h;
+  $("body").scrollTop=0;
+
+  $("rowinfo").textContent="Row "+(r+1).toLocaleString()+" of "+st.rows.length.toLocaleString();
+  $("diffinfo").textContent = n ? (diffs+" of "+n+" pairs differ") : "No pairs defined";
+  $("jump").max=st.rows.length;
+  $("rprev").disabled = r===0;
+  $("rnext").disabled = r>=st.rows.length-1;
+}
+
+function cellHtml(r,id,val){
+  if (!id||id===GAP) return '<div class="cell" style="visibility:hidden"></div>';
+  var ed = st.edited[r+":"+id] ? " edited" : "";
+  return '<div class="cell'+ed+'"><div class="fl">'+esc(nameOf(id))+'</div>'+
+         '<div class="val" contenteditable="true" data-r="'+r+'" data-c="'+id+'">'+
+         esc(val)+'</div></div>';
+}
+
+/* Refresh the match/differs chips without re-rendering the fields, so the
+   caret stays where the person is typing. */
+function updateVerdicts(){
+  var L=st.layout, row=st.rows[st.rowIdx];
+  var n=Math.max(L.left.length,L.right.length), diffs=0;
+  var chips=$("body").querySelectorAll(".verdict");
+  for (var i=0;i<n && i<chips.length;i++){
+    var a=L.left[i], b=L.right[i], cmp="na", txt="\u2014";
+    if (a&&b&&a!==GAP&&b!==GAP){
+      var same = norm(row[a])===norm(row[b]);
+      cmp = same?"same":"diff";
+      txt = same?"match":"differs";
+      if (!same) diffs++;
+    }
+    chips[i].className="verdict "+cmp;
+    chips[i].textContent=txt;
+  }
+  $("diffinfo").textContent = n ? (diffs+" of "+n+" pairs differ") : "No pairs defined";
+}
+
+$("rprev").onclick=function(){ if (st.rowIdx>0){ st.rowIdx--; renderRow(); } };
+$("rnext").onclick=function(){ if (st.rowIdx<st.rows.length-1){ st.rowIdx++; renderRow(); } };
+$("jumpgo").onclick=function(){
+  var v=parseInt($("jump").value,10);
+  if (v>=1&&v<=st.rows.length){ st.rowIdx=v-1; renderRow(); }
+};
+$("jump").onkeydown=function(e){ if (e.key==="Enter") $("jumpgo").click(); };
+
+document.addEventListener("keydown",function(e){
+  if (st.view!=="row"||!e.altKey) return;
+  if (e.key==="ArrowRight"){ e.preventDefault(); $("rnext").click(); }
+  if (e.key==="ArrowLeft"){ e.preventDefault(); $("rprev").click(); }
+});
+
+/* ---------- saving ---------- */
+
+function setDirty(v){ st.dirty=v; $("dirtyflag").classList.toggle("hidden",!v); }
+
+$("savebtn").onclick=function(){
+  var vis=visible();
+  var aoa=[vis.map(nameOf)];
+  st.rows.forEach(function(row){ aoa.push(vis.map(function(id){ return row[id]; })); });
+  var ws=XLSX.utils.aoa_to_sheet(aoa,{cellDates:true});
+  var base=st.fileName.replace(/\.(xlsx|xlsm|xls|csv)$/i,"");
+
+  if (st.isCsv){
+    var blob=new Blob([XLSX.utils.sheet_to_csv(ws)],{type:"text/csv;charset=utf-8"});
+    var a=document.createElement("a");
+    a.href=URL.createObjectURL(blob); a.download=base+"_reviewed.csv"; a.click();
+    URL.revokeObjectURL(a.href);
+  } else {
+    var out=XLSX.utils.book_new();
+    st.wb.SheetNames.forEach(function(n){
+      XLSX.utils.book_append_sheet(out, n===st.sheetName?ws:st.wb.Sheets[n], n);
+    });
+    XLSX.writeFile(out, base+"_reviewed.xlsx");
+  }
+  setDirty(false);
+};
+
+window.onbeforeunload=function(e){ if (st.dirty){ e.preventDefault(); e.returnValue=""; } };
+</script>
+</body>
+</html>
